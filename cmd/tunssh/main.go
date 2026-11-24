@@ -31,12 +31,14 @@ type wailsAndTrayBridge struct {
 	tray          *trayController
 	lastState     atomic.Value
 	lastProfileID atomic.Value
+	lastMode      atomic.Value
 }
 
 func newWailsAndTrayBridge() *wailsAndTrayBridge {
 	b := &wailsAndTrayBridge{}
 	b.lastState.Store(string(sshclient.StateDisconnected))
 	b.lastProfileID.Store("")
+	b.lastMode.Store(string(profile.ModeProxy))
 	return b
 }
 
@@ -68,12 +70,30 @@ func (b *wailsAndTrayBridge) LastProfileID() string {
 	return v
 }
 
+func (b *wailsAndTrayBridge) LastMode() string {
+	v, _ := b.lastMode.Load().(string)
+	if v != string(profile.ModeTUN) {
+		return string(profile.ModeProxy)
+	}
+	return v
+}
+
+func (b *wailsAndTrayBridge) SetSelectedMode(mode string) {
+	if mode != string(profile.ModeTUN) {
+		mode = string(profile.ModeProxy)
+	}
+	b.lastMode.Store(mode)
+}
+
 func (b *wailsAndTrayBridge) Emit(eventName string, data any) {
 	if eventName == "tunnel:status" {
 		if status, ok := data.(app.TunnelStatusDTO); ok {
 			b.lastState.Store(status.State)
 			if status.ProfileID != "" {
 				b.lastProfileID.Store(status.ProfileID)
+			}
+			if isActiveTunnelState(status.State) && (status.Mode == string(profile.ModeProxy) || status.Mode == string(profile.ModeTUN)) {
+				b.lastMode.Store(status.Mode)
 			}
 			b.ctxMu.RLock()
 			tray := b.tray
@@ -92,7 +112,26 @@ func (b *wailsAndTrayBridge) Emit(eventName string, data any) {
 	}
 }
 
+type tunRecoveryAdapter struct {
+	ctrl app.TUNSessionController
+}
+
+func (a tunRecoveryAdapter) IsTUNStateActive(ctx context.Context) (bool, error) {
+	return a.ctrl.IsActiveOnOS(ctx)
+}
+
+func (a tunRecoveryAdapter) RestoreTUN(ctx context.Context, snap recovery.TUNSnapshot) error {
+	return a.ctrl.RestoreFromSnapshot(ctx, app.RecoverySnapshotToNetwork(snap))
+}
+
 func main() {
+	if shouldRunHelper(os.Args[1:]) {
+		if err := runHelper(os.Args[1:]); err != nil {
+			fmt.Fprintf(os.Stderr, "tunssh helper: fatal: %v\n", err)
+			os.Exit(1)
+		}
+		return
+	}
 	if err := run(); err != nil {
 		fmt.Fprintf(os.Stderr, "tunssh: fatal: %v\n", err)
 		os.Exit(1)
@@ -123,7 +162,6 @@ func run() error {
 	if err != nil {
 		return fmt.Errorf("initialize recovery store: %w", err)
 	}
-	restorer := recovery.NewRestorer(recStore, sysProxy)
 
 	scrubber := app.NewSecretScrubber()
 	logBuffer := app.NewLogBuffer(app.DefaultLogBufferCapacity)
@@ -139,12 +177,20 @@ func run() error {
 	)
 	logger := slog.New(redactingHandler)
 
+	tunCtrl := app.NewPlatformTUNController(logger)
+	restorer := recovery.NewRestorer(
+		recStore,
+		sysProxy,
+		recovery.WithTUNRecoveryOps(tunRecoveryAdapter{ctrl: tunCtrl}),
+	)
+
 	appSvc, err := app.NewAppService(app.Config{
 		Profiles:  profileStore,
 		Secrets:   secretStore,
 		Engine:    engine,
 		SysProxy:  sysProxy,
 		Restorer:  restorer,
+		TUN:       tunCtrl,
 		Emitter:   bridge,
 		Scrubber:  scrubber,
 		LogBuffer: logBuffer,
@@ -214,10 +260,13 @@ func run() error {
 				}
 				profileID = profiles[0].ID
 			}
-			if err := appSvc.Connect(profileID, string(profile.ModeProxy)); err != nil {
+			if err := appSvc.Connect(profileID, bridge.LastMode()); err != nil {
 				logger.Warn("Tray connect returned error", "err", err)
 				showWindow()
 			}
+		},
+		OnSelectMode: func(mode string) {
+			bridge.SetSelectedMode(mode)
 		},
 		OnRestore: func() {
 			if err := appSvc.RestoreNetwork(); err != nil {
@@ -231,7 +280,7 @@ func run() error {
 				wailsRuntime.Quit(ctx)
 			}
 		},
-	})
+	}, tunCtrl.Capabilities())
 	bridge.SetTray(tray)
 
 	return wails.Run(&options.App{
@@ -255,6 +304,10 @@ func run() error {
 					bridge.lastProfileID.Store(boot.Status.ProfileID)
 				} else if len(boot.Profiles) > 0 {
 					bridge.lastProfileID.Store(boot.Profiles[0].ID)
+					if boot.TUNEnabled && boot.Profiles[0].PreferredMode == string(profile.ModeTUN) {
+						bridge.SetSelectedMode(string(profile.ModeTUN))
+						tray.SetSelectedMode(string(profile.ModeTUN))
+					}
 				}
 				tray.UpdateStatus(boot.Status)
 			}
@@ -275,9 +328,9 @@ func run() error {
 				case <-sigCtx.Done():
 					return
 				case sig := <-sigCh:
-					logger.Info("Received shutdown signal; restoring OS proxy state", "signal", sig.String())
+					logger.Info("Received shutdown signal; restoring OS network state", "signal", sig.String())
 					quitting.Store(true)
-					cleanCtx, cleanCancel := context.WithTimeout(context.Background(), 5*time.Second)
+					cleanCtx, cleanCancel := context.WithTimeout(context.Background(), 15*time.Second)
 					performShutdown(cleanCtx)
 					cleanCancel()
 					wailsRuntime.Quit(ctx)
@@ -291,9 +344,11 @@ func run() error {
 			}
 			return false
 		},
-		OnShutdown: func(ctx context.Context) {
+		OnShutdown: func(_ context.Context) {
 			quitting.Store(true)
-			performShutdown(ctx)
+			cleanCtx, cleanCancel := context.WithTimeout(context.Background(), 15*time.Second)
+			performShutdown(cleanCtx)
+			cleanCancel()
 		},
 	})
 }

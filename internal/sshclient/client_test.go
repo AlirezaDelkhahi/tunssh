@@ -10,10 +10,12 @@ import (
 	"errors"
 	"io"
 	"net"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
 
@@ -807,5 +809,369 @@ func TestClientAuthMatrixAndDialContextTraffic(t *testing.T) {
 		if !errors.As(err, &mapped) || mapped.Code != ERR_PORT22_TIMEOUT || !mapped.Retryable {
 			t.Fatalf("port 22 timeout Connect -> %+v (%v), want retryable ERR_PORT22_TIMEOUT", mapped, err)
 		}
+	})
+}
+
+func TestClientDialHostPreservesLogicalHostForTOFUAndSnapshot(t *testing.T) {
+	signerA := generateTestSSHSigner(t)
+	signerB := generateTestSSHSigner(t)
+	echoAddr := startEchoServer(t)
+
+	srv := startTestSSHServer(t, testServerOptions{
+		hostSigner: signerA,
+		password:   "tun-secret",
+	})
+	defer srv.Close()
+
+	const logicalHost = "pinned-vps.example.test"
+	expectedDialAddr := net.JoinHostPort("127.0.0.1", strconv.Itoa(srv.Port()))
+
+	t.Run("dials_concrete_DialHost_while_TOFU_and_snapshot_use_logical_Host", func(t *testing.T) {
+		engine := NewClient()
+		realDialer := &net.Dialer{}
+
+		var mu sync.Mutex
+		var dialedAddrs []string
+		engine.dialTCP = func(ctx context.Context, network, addr string) (net.Conn, error) {
+			mu.Lock()
+			dialedAddrs = append(dialedAddrs, addr)
+			mu.Unlock()
+			return realDialer.DialContext(ctx, network, addr)
+		}
+
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+
+		// Step 1: Unpinned connect fails with ERR_HOSTKEY_UNTRUSTED naming logicalHost.
+		err := engine.Connect(ctx, ConnectConfig{
+			ProfileID: "dialhost-tofu",
+			Host:      logicalHost,
+			DialHost:  "127.0.0.1",
+			Port:      srv.Port(),
+			Username:  "ali",
+			Auth: AuthConfig{
+				Type:     AuthPassword,
+				Password: "tun-secret",
+			},
+		})
+		var mapped *MappedError
+		if !errors.As(err, &mapped) || mapped.Code != ERR_HOSTKEY_UNTRUSTED || mapped.Retryable {
+			t.Fatalf("expected non-retryable ERR_HOSTKEY_UNTRUSTED, got %+v (%v)", mapped, err)
+		}
+		var untrusted *ErrHostKeyUntrusted
+		if !errors.As(err, &untrusted) {
+			t.Fatalf("expected *ErrHostKeyUntrusted in error chain, got %v", err)
+		}
+		if untrusted.Host != logicalHost || untrusted.Port != srv.Port() {
+			t.Fatalf("ErrHostKeyUntrusted = (%q, %d), want (%q, %d)", untrusted.Host, untrusted.Port, logicalHost, srv.Port())
+		}
+		if !strings.Contains(mapped.Message, logicalHost) {
+			t.Fatalf("MappedError.Message = %q, want logical host %q", mapped.Message, logicalHost)
+		}
+
+		snap := engine.Snapshot()
+		if snap.Host != logicalHost || snap.Port != srv.Port() {
+			t.Fatalf("Snapshot host/port = (%q, %d), want (%q, %d)", snap.Host, snap.Port, logicalHost, srv.Port())
+		}
+		if snap.HostKeyPrompt == nil || snap.HostKeyPrompt.Host != logicalHost {
+			t.Fatalf("Snapshot.HostKeyPrompt = %+v, want Host=%q", snap.HostKeyPrompt, logicalHost)
+		}
+
+		// Step 2: Pin using the prompted host key and connect cleanly.
+		pin := &HostKeyPin{
+			Algorithm: snap.HostKeyPrompt.Algorithm,
+			SHA256:    snap.HostKeyPrompt.SHA256,
+		}
+		if err := engine.Connect(ctx, ConnectConfig{
+			ProfileID: "dialhost-tofu",
+			Host:      logicalHost,
+			DialHost:  "127.0.0.1",
+			Port:      srv.Port(),
+			Username:  "ali",
+			Auth: AuthConfig{
+				Type:     AuthPassword,
+				Password: "tun-secret",
+			},
+			PinnedHostKey: pin,
+		}); err != nil {
+			t.Fatalf("Connect with DialHost + pinned key failed: %v", err)
+		}
+
+		snap = engine.Snapshot()
+		if snap.State != StateConnected || snap.Host != logicalHost || snap.Port != srv.Port() {
+			t.Fatalf("connected Snapshot = %+v, want StateConnected and Host=%q Port=%d", snap, logicalHost, srv.Port())
+		}
+
+		conn, err := engine.DialContext(ctx, "tcp", echoAddr)
+		if err != nil {
+			t.Fatalf("DialContext failed: %v", err)
+		}
+		assertEchoPayload(t, conn, []byte("dialhost-echo-ok"))
+		_ = conn.Close()
+		if err := engine.Disconnect(ctx); err != nil {
+			t.Fatalf("Disconnect failed: %v", err)
+		}
+
+		// Step 3: Key rotation still reports ERR_HOSTKEY_MISMATCH for logicalHost.
+		srv.SetHostSigner(signerB)
+		err = engine.Connect(ctx, ConnectConfig{
+			ProfileID: "dialhost-tofu",
+			Host:      logicalHost,
+			DialHost:  "127.0.0.1",
+			Port:      srv.Port(),
+			Username:  "ali",
+			Auth: AuthConfig{
+				Type:     AuthPassword,
+				Password: "tun-secret",
+			},
+			PinnedHostKey: pin,
+		})
+		if !errors.As(err, &mapped) || mapped.Code != ERR_HOSTKEY_MISMATCH || mapped.Retryable {
+			t.Fatalf("expected non-retryable ERR_HOSTKEY_MISMATCH, got %+v (%v)", mapped, err)
+		}
+		snap = engine.Snapshot()
+		if snap.Host != logicalHost || snap.HostKeyMismatch == nil || snap.HostKeyMismatch.Host != logicalHost {
+			t.Fatalf("mismatch Snapshot = %+v, want Host=%q", snap, logicalHost)
+		}
+
+		mu.Lock()
+		defer mu.Unlock()
+		if len(dialedAddrs) != 3 {
+			t.Fatalf("dialTCP call count = %d, want 3", len(dialedAddrs))
+		}
+		for i, addr := range dialedAddrs {
+			if addr != expectedDialAddr {
+				t.Fatalf("dialedAddrs[%d] = %q, want %q", i, addr, expectedDialAddr)
+			}
+		}
+	})
+
+	t.Run("validateConnectConfig_requires_Host_and_rejects_bad_DialHost_or_port", func(t *testing.T) {
+		cases := []struct {
+			name string
+			cfg  ConnectConfig
+		}{
+			{
+				name: "empty_host_with_dial_host",
+				cfg: ConnectConfig{
+					Host:     "",
+					DialHost: "127.0.0.1",
+					Port:     srv.Port(),
+					Username: "ali",
+					Auth:     AuthConfig{Type: AuthPassword, Password: "pw"},
+				},
+			},
+			{
+				name: "whitespace_only_dial_host",
+				cfg: ConnectConfig{
+					Host:     logicalHost,
+					DialHost: "   ",
+					Port:     srv.Port(),
+					Username: "ali",
+					Auth:     AuthConfig{Type: AuthPassword, Password: "pw"},
+				},
+			},
+			{
+				name: "leading_or_trailing_whitespace_dial_host",
+				cfg: ConnectConfig{
+					Host:     logicalHost,
+					DialHost: "127.0.0.1 ",
+					Port:     srv.Port(),
+					Username: "ali",
+					Auth:     AuthConfig{Type: AuthPassword, Password: "pw"},
+				},
+			},
+			{
+				name: "empty_port_suffix_in_dial_host",
+				cfg: ConnectConfig{
+					Host:     logicalHost,
+					DialHost: "127.0.0.1:",
+					Port:     srv.Port(),
+					Username: "ali",
+					Auth:     AuthConfig{Type: AuthPassword, Password: "pw"},
+				},
+			},
+			{
+				name: "embedded_port_in_dial_host",
+				cfg: ConnectConfig{
+					Host:     logicalHost,
+					DialHost: "127.0.0.1:443",
+					Port:     srv.Port(),
+					Username: "ali",
+					Auth:     AuthConfig{Type: AuthPassword, Password: "pw"},
+				},
+			},
+			{
+				name: "zero_port_with_dial_host",
+				cfg: ConnectConfig{
+					Host:     logicalHost,
+					DialHost: "127.0.0.1",
+					Port:     0,
+					Username: "ali",
+					Auth:     AuthConfig{Type: AuthPassword, Password: "pw"},
+				},
+			},
+		}
+
+		for _, tc := range cases {
+			t.Run(tc.name, func(t *testing.T) {
+				engine := NewClient()
+				var dialCalled atomic.Bool
+				engine.dialTCP = func(context.Context, string, string) (net.Conn, error) {
+					dialCalled.Store(true)
+					return nil, errors.New("should not dial on invalid config")
+				}
+
+				ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+				defer cancel()
+				err := engine.Connect(ctx, tc.cfg)
+				if err == nil {
+					t.Fatalf("expected validation error for %s", tc.name)
+				}
+				if dialCalled.Load() {
+					t.Fatalf("dialTCP called despite invalid config %s", tc.name)
+				}
+				if got := engine.Snapshot().State; got != StateError {
+					t.Fatalf("state = %q, want %q", got, StateError)
+				}
+			})
+		}
+
+		// Valid IPv6 DialHost (including :: shorthand) passes validation.
+		if err := validateConnectConfig(ConnectConfig{
+			Host:     logicalHost,
+			DialHost: "2001:db8::",
+			Port:     443,
+			Username: "ali",
+		}); err != nil {
+			t.Fatalf("expected valid IPv6 DialHost to pass validation, got %v", err)
+		}
+	})
+}
+
+func TestClientDialControlInvokedAndFailureDoesNotLeak(t *testing.T) {
+	hostSigner := generateTestSSHSigner(t)
+	pin := &HostKeyPin{
+		Algorithm: hostSigner.PublicKey().Type(),
+		SHA256:    ssh.FingerprintSHA256(hostSigner.PublicKey()),
+	}
+
+	t.Run("invoked_with_tcp_and_target_address_before_ssh_handshake", func(t *testing.T) {
+		srv := startTestSSHServer(t, testServerOptions{
+			hostSigner: hostSigner,
+			password:   "pw",
+		})
+		defer srv.Close()
+
+		const logicalHost = "pinned-vps.example.test"
+		wantTarget := net.JoinHostPort("127.0.0.1", strconv.Itoa(srv.Port()))
+
+		var controlCalls atomic.Int32
+		var sawNetwork string
+		var sawAddress string
+		var sawRawConn atomic.Bool
+		var sawServerIdleBeforeConnect atomic.Bool
+
+		engine := NewClient()
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+
+		err := engine.Connect(ctx, ConnectConfig{
+			ProfileID:     "dial-control-ok",
+			Host:          logicalHost,
+			DialHost:      "127.0.0.1",
+			Port:          srv.Port(),
+			Username:      "ali",
+			Auth:          AuthConfig{Type: AuthPassword, Password: "pw"},
+			PinnedHostKey: pin,
+			DialControl: func(network, address string, c syscall.RawConn) error {
+				controlCalls.Add(1)
+				sawNetwork = network
+				sawAddress = address
+				sawRawConn.Store(c != nil)
+				// net.Dialer invokes Control before connect(2), hence before SSH handshake.
+				sawServerIdleBeforeConnect.Store(srv.ActiveRawConns() == 0)
+				return nil
+			},
+		})
+		if err != nil {
+			t.Fatalf("Connect with DialControl failed: %v", err)
+		}
+		defer engine.Disconnect(ctx)
+
+		if got := controlCalls.Load(); got != 1 {
+			t.Fatalf("DialControl calls = %d, want 1", got)
+		}
+		// net.Dialer normalizes "tcp" to "tcp4" (or "tcp6") when invoking Control.
+		if sawNetwork != "tcp4" && sawNetwork != "tcp" {
+			t.Fatalf("DialControl network = %q, want tcp4/tcp", sawNetwork)
+		}
+		if sawAddress != wantTarget {
+			t.Fatalf("DialControl address = %q, want %q", sawAddress, wantTarget)
+		}
+		if !sawRawConn.Load() {
+			t.Fatal("DialControl received nil syscall.RawConn")
+		}
+		if !sawServerIdleBeforeConnect.Load() {
+			t.Fatal("expected DialControl to run before TCP connect / SSH handshake")
+		}
+		if got := engine.Snapshot().Host; got != logicalHost {
+			t.Fatalf("Snapshot.Host = %q, want %q", got, logicalHost)
+		}
+	})
+
+	t.Run("failing_DialControl_returns_mapped_error_without_goroutine_leak", func(t *testing.T) {
+		srv := startTestSSHServer(t, testServerOptions{
+			hostSigner: hostSigner,
+			password:   "pw",
+		})
+		defer srv.Close()
+
+		runtime.GC()
+		time.Sleep(30 * time.Millisecond)
+		baseline := runtime.NumGoroutine()
+
+		controlErr := errors.New("mock socket bind error")
+		var controlCalls atomic.Int32
+
+		engine := NewClient()
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+
+		err := engine.Connect(ctx, ConnectConfig{
+			ProfileID:     "dial-control-fail",
+			Host:          "pinned-vps.example.test",
+			DialHost:      "127.0.0.1",
+			Port:          srv.Port(),
+			Username:      "ali",
+			Auth:          AuthConfig{Type: AuthPassword, Password: "pw"},
+			PinnedHostKey: pin,
+			DialControl: func(network, address string, c syscall.RawConn) error {
+				controlCalls.Add(1)
+				return controlErr
+			},
+		})
+		var mapped *MappedError
+		if !errors.As(err, &mapped) {
+			t.Fatalf("expected *MappedError, got %T (%v)", err, err)
+		}
+		if mapped.Code != ERR_NETWORK || !mapped.Retryable {
+			t.Fatalf("mapped = %+v, want retryable ERR_NETWORK", mapped)
+		}
+		if !errors.Is(err, controlErr) {
+			t.Fatalf("expected error chain to contain %v, got %v", controlErr, err)
+		}
+		if got := controlCalls.Load(); got != 1 {
+			t.Fatalf("DialControl calls = %d, want 1", got)
+		}
+		if got := srv.ActiveRawConns(); got != 0 {
+			t.Fatalf("server ActiveRawConns = %d, want 0 when DialControl fails", got)
+		}
+		snap := engine.Snapshot()
+		if snap.State != StateError || snap.LastError == nil {
+			t.Fatalf("Snapshot = %+v, want StateError with LastError", snap)
+		}
+
+		settleGoroutines(t, baseline, 1)
 	})
 }

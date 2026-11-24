@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import type { ProfileView, TunnelStatusDTO } from "../api/bridge";
+import type { ProfileView, TUNCapsDTO, TunnelStatusDTO } from "../api/bridge";
 import { formatBytes, formatDuration, formatRate } from "../utils/format";
 import {
   ActivityIcon,
@@ -12,6 +12,7 @@ import {
 
 interface HeroConnectionCardProps {
   status: TunnelStatusDTO;
+  tunCaps: TUNCapsDTO;
   activeProfile: ProfileView | null;
   busy: boolean;
   onConnect: () => void;
@@ -30,6 +31,7 @@ const PROFILE_FIXABLE_ERROR_CODES = new Set([
 
 export function HeroConnectionCard({
   status,
+  tunCaps,
   activeProfile,
   busy,
   onConnect,
@@ -143,11 +145,24 @@ export function HeroConnectionCard({
         </div>
 
         <div className="hero-card__meta">
-          {isConnected && (
-            <span className="endpoint-chip" dir="ltr" title="Local SOCKS5 / HTTP ports">
-              :{status.socks_port || 10808} / :{status.http_port || 10809}
-            </span>
-          )}
+          {isConnected &&
+            (status.mode === "tun" ? (
+              <code
+                className="endpoint-chip endpoint-chip--tun"
+                dir="ltr"
+                title={`Full TUN adapter (${tunCaps.iface_name || "tunssh0"}) with DNS ${tunCaps.tun_dns || "198.18.0.2"}:53`}
+              >
+                {tunCaps.iface_name || "tunssh0"} • {tunCaps.tun_dns || "198.18.0.2"}:53
+              </code>
+            ) : (
+              <code
+                className="endpoint-chip"
+                dir="ltr"
+                title="Local SOCKS5 / HTTP ports"
+              >
+                :{status.socks_port || 10808} / :{status.http_port || 10809}
+              </code>
+            ))}
           <span
             className={`session-timer ${isConnected ? "is-active" : ""}`}
             dir="ltr"

@@ -10,6 +10,7 @@ import {
   type ProxyCapabilitiesDTO,
   type SaveProfileRequest,
   type StartupRecoveryDTO,
+  type TUNCapsDTO,
   type TunnelStatusDTO,
 } from "./api/bridge";
 import { FooterBar } from "./components/FooterBar";
@@ -46,6 +47,16 @@ const DEFAULT_PROXY_CAPS: ProxyCapabilitiesDTO = {
   desktop_env: "",
 };
 
+const DEFAULT_TUN_CAPS: TUNCapsDTO = {
+  supported: false,
+  requires_elevation: true,
+  has_persistent_cap: false,
+  can_enable_persistent_cap: false,
+  iface_name: "tunssh0",
+  tun_ipv4: "198.18.0.1",
+  tun_dns: "198.18.0.2",
+};
+
 interface ToastState {
   tone: "info" | "success" | "error";
   message: string;
@@ -60,6 +71,7 @@ export function App() {
   );
   const [vaultLocked, setVaultLocked] = useState(false);
   const [tunEnabled, setTunEnabled] = useState(false);
+  const [tunCaps, setTunCaps] = useState<TUNCapsDTO>(DEFAULT_TUN_CAPS);
   const [proxyCaps, setProxyCaps] =
     useState<ProxyCapabilitiesDTO>(DEFAULT_PROXY_CAPS);
   const [status, setStatus] = useState<TunnelStatusDTO>(DEFAULT_STATUS);
@@ -94,6 +106,7 @@ export function App() {
   const [connectBusy, setConnectBusy] = useState(false);
   const [disconnectBusy, setDisconnectBusy] = useState(false);
   const [bypassBusy, setBypassBusy] = useState(false);
+  const [persistentCapBusy, setPersistentCapBusy] = useState(false);
   const [restoringNetwork, setRestoringNetwork] = useState(false);
   const [toast, setToast] = useState<ToastState | null>(null);
 
@@ -124,6 +137,12 @@ export function App() {
       setVaultBackend(boot.vault_backend);
       setVaultLocked(boot.vault_locked);
       setTunEnabled(boot.tun_enabled);
+      setTunCaps(
+        boot.tun_caps ?? {
+          ...DEFAULT_TUN_CAPS,
+          supported: boot.tun_enabled,
+        },
+      );
       setProxyCaps(boot.proxy_caps);
       setStatus(boot.status);
       setProfiles(boot.profiles);
@@ -137,7 +156,19 @@ export function App() {
           ? boot.status.profile_id
           : boot.profiles[0]?.id ?? "";
       setSelectedProfileId(preferredId);
-      setActiveMode(boot.tun_enabled && boot.status.mode === "tun" ? "tun" : "proxy");
+      const initialProfile =
+        boot.profiles.find((p) => p.id === preferredId) ?? null;
+      const statusIsActive =
+        boot.status.state === "connected" ||
+        boot.status.state === "connecting" ||
+        boot.status.state === "reconnecting";
+      setActiveMode(
+        boot.tun_enabled &&
+          (boot.status.mode === "tun" ||
+            (!statusIsActive && initialProfile?.preferred_mode === "tun"))
+          ? "tun"
+          : "proxy",
+      );
 
       if (!boot.status.env_snippet) {
         api
@@ -163,14 +194,17 @@ export function App() {
   useEffect(() => {
     const unsubStatus = subscribeEvent("tunnel:status", (next) => {
       setStatus(next);
+      const nextIsActive =
+        next.state === "connecting" ||
+        next.state === "connected" ||
+        next.state === "reconnecting";
       if (next.profile_id) {
         setSelectedProfileId((prev) =>
-          next.state === "connecting" ||
-          next.state === "connected" ||
-          next.state === "reconnecting"
-            ? next.profile_id
-            : prev || next.profile_id,
+          nextIsActive ? next.profile_id : prev || next.profile_id,
         );
+      }
+      if (nextIsActive) {
+        setActiveMode(next.mode === "tun" ? "tun" : "proxy");
       }
       if (next.state === "connected") {
         api
@@ -315,7 +349,20 @@ export function App() {
     }
   };
 
+  const handleSelectProfile = (profileID: string) => {
+    setSelectedProfileId(profileID);
+    if (!isTunnelActive) {
+      const picked = profiles.find((p) => p.id === profileID);
+      setActiveMode(
+        tunEnabled && picked?.preferred_mode === "tun" ? "tun" : "proxy",
+      );
+    }
+  };
+
   const handleSaveProfile = async (req: SaveProfileRequest) => {
+    const previousPreferredMode = req.id
+      ? profiles.find((p) => p.id === req.id)?.preferred_mode
+      : undefined;
     const saved = await api.SaveProfile(req);
     setProfiles((prev) => {
       const exists = prev.some((p) => p.id === saved.id);
@@ -325,6 +372,11 @@ export function App() {
       return [...prev, saved];
     });
     setSelectedProfileId(saved.id);
+    if (!isTunnelActive && (!req.id || saved.preferred_mode !== previousPreferredMode)) {
+      setActiveMode(
+        tunEnabled && saved.preferred_mode === "tun" ? "tun" : "proxy",
+      );
+    }
     showToast(
       "success",
       req.id ? `Updated "${saved.name}".` : `Created "${saved.name}".`,
@@ -335,9 +387,15 @@ export function App() {
     await api.DeleteProfile(profileID);
     const updated = await api.ListProfiles();
     setProfiles(updated);
-    setSelectedProfileId((prev) =>
-      prev === profileID ? updated[0]?.id ?? "" : prev,
-    );
+    const nextSelectedId =
+      selectedProfileId === profileID ? updated[0]?.id ?? "" : selectedProfileId;
+    setSelectedProfileId(nextSelectedId);
+    if (!isTunnelActive && selectedProfileId === profileID) {
+      const nextProfile = updated.find((p) => p.id === nextSelectedId);
+      setActiveMode(
+        tunEnabled && nextProfile?.preferred_mode === "tun" ? "tun" : "proxy",
+      );
+    }
     showToast("info", "Profile deleted.");
   };
 
@@ -371,14 +429,37 @@ export function App() {
     setRestoringNetwork(true);
     try {
       await api.RestoreNetwork();
-      setRecovery((prev) =>
-        prev ? { ...prev, needs_elevation: false, recovered: true } : prev,
-      );
+      setRecovery(null);
+      setRecoveryDismissed(true);
       showToast("success", "OS network settings verified and restored.");
     } catch (err) {
       showToast("error", formatBridgeError(err));
     } finally {
       setRestoringNetwork(false);
+    }
+  };
+
+  const handleEnablePersistentTUNAccess = async () => {
+    setPersistentCapBusy(true);
+    try {
+      const message = await api.EnablePersistentTUNAccess();
+      try {
+        const boot = await api.GetBootstrapState();
+        setTunEnabled(boot.tun_enabled);
+        if (boot.tun_caps) {
+          setTunCaps(boot.tun_caps);
+        }
+      } catch {
+        // Keep current tunCaps until next bootstrap or restart takes effect.
+      }
+      showToast(
+        "success",
+        message || "Persistent TUN access configured successfully.",
+      );
+    } catch (err) {
+      showToast("error", formatBridgeError(err));
+    } finally {
+      setPersistentCapBusy(false);
     }
   };
 
@@ -440,10 +521,15 @@ export function App() {
       const list = await api.ListProfiles();
       setProfiles(list);
       setSelectedProfileId(imported.id);
+      if (!isTunnelActive) {
+        setActiveMode(
+          tunEnabled && imported.preferred_mode === "tun" ? "tun" : "proxy",
+        );
+      }
       showToast("success", `Imported profile "${imported.name}".`);
       return imported;
     },
-    [showToast],
+    [showToast, tunEnabled, isTunnelActive],
   );
 
   const handleToggleLogs = () => {
@@ -516,7 +602,7 @@ export function App() {
         profiles={profiles}
         activeProfile={activeProfile}
         disabled={isTunnelActive}
-        onSelectProfile={(id) => setSelectedProfileId(id)}
+        onSelectProfile={handleSelectProfile}
         onNewProfile={() => setProfileModal({ open: true, profileId: null })}
         onEditProfile={() => {
           if (activeProfile) {
@@ -529,6 +615,7 @@ export function App() {
       <main className="main-stack">
         <HeroConnectionCard
           status={status}
+          tunCaps={tunCaps}
           activeProfile={activeProfile}
           busy={isTunnelActive ? disconnectBusy : connectBusy}
           onConnect={() => void handleConnect()}
@@ -546,17 +633,23 @@ export function App() {
         <ModeRoutingCard
           mode={activeMode}
           tunEnabled={tunEnabled}
+          tunCaps={tunCaps}
+          isTunnelActive={isTunnelActive}
           activeProfile={activeProfile}
           proxyCaps={proxyCaps}
           envSnippet={envSnippet}
           bypassBusy={bypassBusy}
+          persistentCapBusy={persistentCapBusy}
           onModeChange={(nextMode) => {
-            if (nextMode === "tun" && !tunEnabled) {
+            if (isTunnelActive || (nextMode === "tun" && !tunEnabled)) {
               return;
             }
             setActiveMode(nextMode);
           }}
           onToggleBypass={(bypass) => void handleToggleBypass(bypass)}
+          onEnablePersistentTUNAccess={() =>
+            void handleEnablePersistentTUNAccess()
+          }
         />
       </main>
 
@@ -583,6 +676,7 @@ export function App() {
         unreadSeverity={unreadSeverity}
         unreadCount={unreadCount}
         restoringNetwork={restoringNetwork}
+        tunEnabled={tunEnabled}
         onToggleLogs={handleToggleLogs}
         onRestoreNetwork={() => void handleRestoreNetwork()}
       />
@@ -595,6 +689,7 @@ export function App() {
       <ProfileModal
         open={profileModal.open}
         profile={editingProfile}
+        tunEnabled={tunEnabled}
         onClose={() => setProfileModal({ open: false, profileId: null })}
         onSave={handleSaveProfile}
         onDelete={handleDeleteProfile}

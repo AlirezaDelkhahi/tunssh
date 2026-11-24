@@ -26,8 +26,8 @@ export function RecoveryBanner({
   return (
     <section
       className={`recovery-banner ${isElevationNeeded ? "recovery-banner--warn" : "recovery-banner--ok"}`}
-      role="status"
-      aria-live="polite"
+      role={isElevationNeeded ? "alert" : "status"}
+      aria-live={isElevationNeeded ? "assertive" : "polite"}
     >
       <div className="recovery-banner__icon">
         {isElevationNeeded ? (
@@ -47,7 +47,7 @@ export function RecoveryBanner({
           <div className="recovery-banner__actions">
             <button
               type="button"
-              className="btn btn--sm btn--danger-outline"
+              className="btn btn--sm btn--warn-restore"
               onClick={onRestoreNetwork}
               disabled={restoring}
             >
@@ -61,6 +61,7 @@ export function RecoveryBanner({
         type="button"
         className="icon-btn icon-btn--ghost"
         onClick={onDismiss}
+        disabled={restoring}
         aria-label="Dismiss recovery notification"
         title="Dismiss"
       >

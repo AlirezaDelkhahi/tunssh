@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"slices"
 	"time"
 
 	"github.com/AlirezaDelkhahi/tunssh/internal/sysproxy"
@@ -23,6 +24,12 @@ type StartupRecoveryResult struct {
 	Mode           string `json:"mode,omitempty"`
 	NeedsElevation bool   `json:"needs_elevation,omitempty"`
 	Message        string `json:"message,omitempty"`
+}
+
+// TUNRecoveryOps abstracts OS-level Milestone 2 TUN state inspection and network restoration.
+type TUNRecoveryOps interface {
+	IsTUNStateActive(ctx context.Context) (bool, error)
+	RestoreTUN(ctx context.Context, snap TUNSnapshot) error
 }
 
 // RestorerOption configures optional Restorer dependencies for deterministic testing.
@@ -46,10 +53,18 @@ func WithNowFunc(fn func() time.Time) RestorerOption {
 	}
 }
 
-// Restorer coordinates crash-safe state persistence with OS system proxy mutations and startup recovery.
+// WithTUNRecoveryOps configures optional Milestone 2 TUN inspection and restore callbacks.
+func WithTUNRecoveryOps(ops TUNRecoveryOps) RestorerOption {
+	return func(r *Restorer) {
+		r.tunOps = ops
+	}
+}
+
+// Restorer coordinates crash-safe state persistence with OS network mutations and startup recovery.
 type Restorer struct {
 	store    RecoveryStore
 	sysProxy sysproxy.SystemProxyManager
+	tunOps   TUNRecoveryOps
 	pidFn    func() int
 	nowFn    func() time.Time
 }
@@ -92,8 +107,8 @@ func (r *Restorer) BeginProxySession(ctx context.Context, cfg sysproxy.ProxyAppl
 		SchemaVersion: SchemaVersion,
 		Dirty:         true,
 		Mode:          RecoveryModeProxy,
-		PID:           r.pidFn(),
-		UpdatedAtUTC:  r.nowFn().UTC(),
+		PID:           r.currentPID(),
+		UpdatedAtUTC:  r.nowUTC(),
 		ProxySnapshot: &snap,
 	}
 	if err := r.store.SaveDirty(state); err != nil {
@@ -114,6 +129,31 @@ func (r *Restorer) BeginProxySession(ctx context.Context, cfg sysproxy.ProxyAppl
 	return nil
 }
 
+// BeginTUNSession persists dirty TUN recovery state strictly prior to any OS route or DNS mutation.
+func (r *Restorer) BeginTUNSession(ctx context.Context, snap TUNSnapshot) error {
+	ctx = normalizeContext(ctx)
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if err := r.requireStore(); err != nil {
+		return err
+	}
+
+	snapCopy := cloneTUNSnapshot(snap)
+	state := RecoveryState{
+		SchemaVersion: SchemaVersion,
+		Dirty:         true,
+		Mode:          RecoveryModeTUN,
+		PID:           r.currentPID(),
+		UpdatedAtUTC:  r.nowUTC(),
+		TUNSnapshot:   &snapCopy,
+	}
+	if err := r.store.SaveDirty(state); err != nil {
+		return fmt.Errorf("recovery: save dirty state: %w", err)
+	}
+	return nil
+}
+
 // RestoreProxySession idempotently restores a dirty proxy session and marks recovery_state.json clean.
 func (r *Restorer) RestoreProxySession(ctx context.Context) error {
 	ctx, state, err := r.loadForOperation(ctx)
@@ -123,6 +163,34 @@ func (r *Restorer) RestoreProxySession(ctx context.Context) error {
 	return r.restoreProxyWithState(ctx, state)
 }
 
+// RestoreTUNSession idempotently restores a dirty TUN session (or delegates proxy mode) and marks recovery_state.json clean.
+func (r *Restorer) RestoreTUNSession(ctx context.Context) error {
+	ctx, state, err := r.loadForOperation(ctx)
+	if err != nil {
+		return err
+	}
+	return r.restoreTUNWithState(ctx, state)
+}
+
+// CompleteTUNSession idempotently marks recovery_state.json clean after an active TUN session or
+// failed StartTUN attempt has already cleanly rolled back OS routes and DNS in-band.
+func (r *Restorer) CompleteTUNSession(ctx context.Context) error {
+	ctx, state, err := r.loadForOperation(ctx)
+	if err != nil {
+		return err
+	}
+	if state == nil || !state.Dirty || state.Mode == RecoveryModeTUN {
+		if err := r.store.MarkClean(); err != nil {
+			return fmt.Errorf("recovery: mark clean: %w", err)
+		}
+		return nil
+	}
+	if state.Mode == RecoveryModeProxy {
+		return r.restoreProxyWithState(ctx, state)
+	}
+	return fmt.Errorf("%w: %q", ErrUnsupportedMode, state.Mode)
+}
+
 // RestoreNetwork is the panic-button entry point that restores OS network state idempotently.
 func (r *Restorer) RestoreNetwork(ctx context.Context) error {
 	ctx, state, err := r.loadForOperation(ctx)
@@ -130,12 +198,12 @@ func (r *Restorer) RestoreNetwork(ctx context.Context) error {
 		return err
 	}
 	if state != nil && state.Dirty && state.Mode == RecoveryModeTUN {
-		return ErrTUNRestoreNotSupported
+		return r.restoreTUNWithState(ctx, state)
 	}
 	return r.restoreProxyWithState(ctx, state)
 }
 
-// CheckAndRecoverOnStartup inspects recovery_state.json on launch and recovers dirty proxy sessions from dead PIDs.
+// CheckAndRecoverOnStartup inspects recovery_state.json on launch and recovers dirty sessions from dead PIDs.
 func (r *Restorer) CheckAndRecoverOnStartup(ctx context.Context) (StartupRecoveryResult, error) {
 	ctx, state, err := r.loadForOperation(ctx)
 	if err != nil {
@@ -144,7 +212,7 @@ func (r *Restorer) CheckAndRecoverOnStartup(ctx context.Context) (StartupRecover
 	if state == nil || !state.Dirty {
 		return StartupRecoveryResult{}, nil
 	}
-	if state.PID == r.pidFn() {
+	if state.PID == r.currentPID() {
 		return StartupRecoveryResult{}, nil
 	}
 
@@ -159,11 +227,25 @@ func (r *Restorer) CheckAndRecoverOnStartup(ctx context.Context) (StartupRecover
 			Message:   "Previous session ended unexpectedly. OS proxy settings were automatically restored.",
 		}, nil
 	case RecoveryModeTUN:
+		if r.tunOps != nil {
+			active, activeErr := r.tunOps.IsTUNStateActive(ctx)
+			if activeErr == nil && !active {
+				if err := r.store.MarkClean(); err != nil {
+					return StartupRecoveryResult{}, fmt.Errorf("recovery: mark clean: %w", err)
+				}
+				return StartupRecoveryResult{
+					Recovered:      true,
+					Mode:           RecoveryModeTUN,
+					NeedsElevation: false,
+					Message:        "Previous TUN session ended unexpectedly; OS network routes were already cleanly restored.",
+				}, nil
+			}
+		}
 		return StartupRecoveryResult{
 			Recovered:      false,
 			Mode:           RecoveryModeTUN,
 			NeedsElevation: true,
-			Message:        "Previous TUN session ended unexpectedly (Milestone 2 elevation required to restore routes).",
+			Message:        "Previous TUN session ended unexpectedly. Click Restore Network to clean up remaining TUN routes and DNS.",
 		}, nil
 	default:
 		return StartupRecoveryResult{}, fmt.Errorf("%w: %q", ErrUnsupportedMode, state.Mode)
@@ -216,6 +298,37 @@ func (r *Restorer) restoreProxyWithState(ctx context.Context, state *RecoverySta
 	return nil
 }
 
+func (r *Restorer) restoreTUNWithState(ctx context.Context, state *RecoveryState) error {
+	if state == nil || !state.Dirty {
+		if err := r.store.MarkClean(); err != nil {
+			return fmt.Errorf("recovery: mark clean: %w", err)
+		}
+		return nil
+	}
+
+	switch state.Mode {
+	case RecoveryModeProxy:
+		return r.restoreProxyWithState(ctx, state)
+	case RecoveryModeTUN:
+		if r.tunOps == nil {
+			return ErrTUNRestoreNotSupported
+		}
+		var snap TUNSnapshot
+		if state.TUNSnapshot != nil {
+			snap = cloneTUNSnapshot(*state.TUNSnapshot)
+		}
+		if err := r.tunOps.RestoreTUN(ctx, snap); err != nil {
+			return fmt.Errorf("recovery: restore TUN: %w", err)
+		}
+		if err := r.store.MarkClean(); err != nil {
+			return fmt.Errorf("recovery: mark clean: %w", err)
+		}
+		return nil
+	default:
+		return fmt.Errorf("%w: %q", ErrUnsupportedMode, state.Mode)
+	}
+}
+
 func (r *Restorer) requireStore() error {
 	if r == nil || r.store == nil {
 		return errors.New("recovery: recovery store must not be nil")
@@ -228,6 +341,43 @@ func (r *Restorer) requireSysProxy() error {
 		return errors.New("recovery: system proxy manager must not be nil")
 	}
 	return nil
+}
+
+func (r *Restorer) currentPID() int {
+	if r != nil && r.pidFn != nil {
+		return r.pidFn()
+	}
+	return os.Getpid()
+}
+
+func (r *Restorer) nowUTC() time.Time {
+	if r != nil && r.nowFn != nil {
+		return r.nowFn().UTC()
+	}
+	return time.Now().UTC()
+}
+
+func cloneTUNSnapshot(snap TUNSnapshot) TUNSnapshot {
+	snap.OrigDNSServers = slices.Clone(snap.OrigDNSServers)
+	if snap.WinAdapterDNSBackups != nil {
+		winBackups := make([]WinAdapterDNSBackup, len(snap.WinAdapterDNSBackups))
+		for i, b := range snap.WinAdapterDNSBackups {
+			b.IPv4DNS = slices.Clone(b.IPv4DNS)
+			b.IPv6DNS = slices.Clone(b.IPv6DNS)
+			winBackups[i] = b
+		}
+		snap.WinAdapterDNSBackups = winBackups
+	}
+	if snap.LinuxDNSBackups != nil {
+		linuxBackups := make([]LinuxDNSBackup, len(snap.LinuxDNSBackups))
+		for i, b := range snap.LinuxDNSBackups {
+			b.DNSServers = slices.Clone(b.DNSServers)
+			linuxBackups[i] = b
+		}
+		snap.LinuxDNSBackups = linuxBackups
+	}
+	snap.InstalledRoutes = slices.Clone(snap.InstalledRoutes)
+	return snap
 }
 
 func normalizeContext(ctx context.Context) context.Context {

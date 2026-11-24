@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=tunssh
+Comment=Cross-platform SSH desktop tunnel client
+Exec=/usr/bin/tunssh
+Icon=tunssh
+Terminal=false
+Categories=Network;Utility;
+StartupWMClass=tunssh

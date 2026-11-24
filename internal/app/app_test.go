@@ -14,8 +14,10 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"net/netip"
 	"os"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -29,8 +31,10 @@ import (
 	"github.com/AlirezaDelkhahi/tunssh/internal/profile"
 	"github.com/AlirezaDelkhahi/tunssh/internal/proxy"
 	"github.com/AlirezaDelkhahi/tunssh/internal/recovery"
+	"github.com/AlirezaDelkhahi/tunssh/internal/splitroute"
 	"github.com/AlirezaDelkhahi/tunssh/internal/sshclient"
 	"github.com/AlirezaDelkhahi/tunssh/internal/sysproxy"
+	"github.com/AlirezaDelkhahi/tunssh/internal/tun"
 )
 
 type recordedEvent struct {
@@ -1290,4 +1294,1208 @@ func TestAppService_StatsLoopGuardAndSetBypassRollback(t *testing.T) {
 	if after := h.emitter.Count("tunnel:stats"); after != countAtDisconn {
 		t.Fatalf("expected zero tunnel:stats after Disconnect (%d -> %d)", countAtDisconn, after)
 	}
+}
+
+type mockTUNSessionController struct {
+	mu sync.Mutex
+
+	caps         TUNCapsDTO
+	prepareSnap  splitroute.NetworkSnapshot
+	prepareErr   error
+	startErr     error
+	setBypassErr error
+	stopErr      error
+	stats        tun.Stats
+	isActiveOnOS bool
+	isActiveErr  error
+	restoreErr   error
+
+	prepareCalls  int
+	startCalls    int
+	startReqs     []TUNStartRequest
+	bypassCalls   []bool
+	stopCalls     int
+	restoreCalls  int
+	restoredSnaps []splitroute.NetworkSnapshot
+	isActiveCalls int
+
+	onPrepare func(ctx context.Context)
+	onStart   func(ctx context.Context, req TUNStartRequest, dialer sshclient.TunnelDialer)
+	onStop    func(ctx context.Context)
+}
+
+var _ TUNSessionController = (*mockTUNSessionController)(nil)
+
+func newMockTUNSessionController() *mockTUNSessionController {
+	return &mockTUNSessionController{
+		caps: TUNCapsDTO{
+			Supported:              true,
+			RequiresElevation:      true,
+			HasPersistentCap:       false,
+			CanEnablePersistentCap: true,
+			IfaceName:              splitroute.TUNIfaceName,
+			TUNIPv4:                splitroute.TUNIPv4Addr,
+			TUNDNS:                 splitroute.TUNDNSServer,
+		},
+		prepareSnap: splitroute.NetworkSnapshot{
+			OrigGateway:    "192.168.1.1",
+			OrigIfaceName:  "eth0",
+			OrigIfaceIndex: 2,
+			OrigDNSServers: []string{"1.1.1.1"},
+			DNSStrategy:    "resolv.conf",
+			TUNIfaceName:   splitroute.TUNIfaceName,
+		},
+	}
+}
+
+func (m *mockTUNSessionController) Capabilities() TUNCapsDTO {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.caps
+}
+
+func (m *mockTUNSessionController) PrepareSession(ctx context.Context) (splitroute.NetworkSnapshot, error) {
+	if err := ctx.Err(); err != nil {
+		return splitroute.NetworkSnapshot{}, err
+	}
+	m.mu.Lock()
+	m.prepareCalls++
+	cb := m.onPrepare
+	snap := cloneNetworkSnapshot(m.prepareSnap)
+	err := m.prepareErr
+	m.mu.Unlock()
+	if cb != nil {
+		cb(ctx)
+	}
+	if err != nil {
+		return splitroute.NetworkSnapshot{}, err
+	}
+	return snap, nil
+}
+
+func (m *mockTUNSessionController) StartTUN(ctx context.Context, req TUNStartRequest, dialer sshclient.TunnelDialer) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	m.mu.Lock()
+	m.startCalls++
+	reqCopy := req
+	reqCopy.Snapshot = cloneNetworkSnapshot(req.Snapshot)
+	m.startReqs = append(m.startReqs, reqCopy)
+	cb := m.onStart
+	err := m.startErr
+	m.mu.Unlock()
+	if cb != nil {
+		cb(ctx, reqCopy, dialer)
+	}
+	return err
+}
+
+func (m *mockTUNSessionController) SetBypass(ctx context.Context, bypassIranLAN bool) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.bypassCalls = append(m.bypassCalls, bypassIranLAN)
+	return m.setBypassErr
+}
+
+func (m *mockTUNSessionController) Stop(ctx context.Context) error {
+	m.mu.Lock()
+	m.stopCalls++
+	cb := m.onStop
+	err := m.stopErr
+	m.mu.Unlock()
+	if cb != nil {
+		cb(ctx)
+	}
+	return err
+}
+
+func (m *mockTUNSessionController) Stats() tun.Stats {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.stats
+}
+
+func (m *mockTUNSessionController) IsActiveOnOS(ctx context.Context) (bool, error) {
+	if err := ctx.Err(); err != nil {
+		return false, err
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.isActiveCalls++
+	return m.isActiveOnOS, m.isActiveErr
+}
+
+func (m *mockTUNSessionController) RestoreFromSnapshot(ctx context.Context, snap splitroute.NetworkSnapshot) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.restoreCalls++
+	m.restoredSnaps = append(m.restoredSnaps, cloneNetworkSnapshot(snap))
+	return m.restoreErr
+}
+
+type tunRecoveryBridge struct {
+	ctrl TUNSessionController
+}
+
+func (b tunRecoveryBridge) IsTUNStateActive(ctx context.Context) (bool, error) {
+	return b.ctrl.IsActiveOnOS(ctx)
+}
+
+func (b tunRecoveryBridge) RestoreTUN(ctx context.Context, snap recovery.TUNSnapshot) error {
+	return b.ctrl.RestoreFromSnapshot(ctx, RecoverySnapshotToNetwork(snap))
+}
+
+type faultRecoveryStore struct {
+	inner        recovery.RecoveryStore
+	saveDirtyErr error
+}
+
+func (f *faultRecoveryStore) Load() (*recovery.RecoveryState, error) {
+	return f.inner.Load()
+}
+
+func (f *faultRecoveryStore) SaveDirty(state recovery.RecoveryState) error {
+	if f.saveDirtyErr != nil {
+		return f.saveDirtyErr
+	}
+	return f.inner.SaveDirty(state)
+}
+
+func (f *faultRecoveryStore) MarkClean() error {
+	return f.inner.MarkClean()
+}
+
+type recordingSSHEngine struct {
+	mu           sync.Mutex
+	connectCfgs  []sshclient.ConnectConfig
+	connectErr   error
+	disconnCalls int
+	snap         sshclient.EngineSnapshot
+	subs         []func(sshclient.EngineSnapshot)
+}
+
+func (e *recordingSSHEngine) DialContext(context.Context, string, string) (net.Conn, error) {
+	return nil, errors.New("not implemented")
+}
+
+func (e *recordingSSHEngine) Connect(ctx context.Context, cfg sshclient.ConnectConfig) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	e.mu.Lock()
+	e.connectCfgs = append(e.connectCfgs, cfg)
+	err := e.connectErr
+	if err == nil {
+		e.snap = sshclient.EngineSnapshot{
+			State:       sshclient.StateConnected,
+			ProfileID:   cfg.ProfileID,
+			Host:        cfg.Host,
+			Port:        cfg.Port,
+			ConnectedAt: time.Now(),
+		}
+	} else {
+		e.snap = sshclient.EngineSnapshot{
+			State:     sshclient.StateError,
+			ProfileID: cfg.ProfileID,
+			Host:      cfg.Host,
+			Port:      cfg.Port,
+		}
+	}
+	snap := e.snap
+	subs := slices.Clone(e.subs)
+	e.mu.Unlock()
+	for _, fn := range subs {
+		fn(snap)
+	}
+	return err
+}
+
+func (e *recordingSSHEngine) Disconnect(context.Context) error {
+	e.mu.Lock()
+	e.disconnCalls++
+	e.snap.State = sshclient.StateDisconnected
+	e.snap.LastError = nil
+	snap := e.snap
+	subs := slices.Clone(e.subs)
+	e.mu.Unlock()
+	for _, fn := range subs {
+		fn(snap)
+	}
+	return nil
+}
+
+func (e *recordingSSHEngine) MeasureRTT(context.Context) (time.Duration, error) {
+	return 5 * time.Millisecond, nil
+}
+
+func (e *recordingSSHEngine) Snapshot() sshclient.EngineSnapshot {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return e.snap
+}
+
+func (e *recordingSSHEngine) Subscribe(fn func(sshclient.EngineSnapshot)) func() {
+	e.mu.Lock()
+	e.subs = append(e.subs, fn)
+	e.mu.Unlock()
+	return func() {}
+}
+
+func (e *recordingSSHEngine) EmitSnapshot(snap sshclient.EngineSnapshot) {
+	e.mu.Lock()
+	e.snap = snap
+	subs := slices.Clone(e.subs)
+	e.mu.Unlock()
+	for _, fn := range subs {
+		fn(snap)
+	}
+}
+
+func newTUNAppHarness(
+	t *testing.T,
+	statsInterval time.Duration,
+	tunCtrl TUNSessionController,
+	resolveFn func(ctx context.Context, host string) (netip.Addr, error),
+	enableCapFn func(ctx context.Context) error,
+	recStoreOverride recovery.RecoveryStore,
+	engineOverride sshclient.Engine,
+) *appHarness {
+	t.Helper()
+	dir := t.TempDir()
+
+	profStore, err := profile.NewFileStore(dir)
+	if err != nil {
+		t.Fatalf("NewFileStore: %v", err)
+	}
+	secStore := profile.NewEncryptedFileSecretStore(dir)
+	fileRecStore, err := recovery.NewFileRecoveryStore(dir)
+	if err != nil {
+		t.Fatalf("NewFileRecoveryStore: %v", err)
+	}
+	var recStore recovery.RecoveryStore = fileRecStore
+	if recStoreOverride != nil {
+		recStore = recStoreOverride
+	}
+	sysProx := newMockSysProxy()
+	var restorerOpts []recovery.RestorerOption
+	if tunCtrl != nil {
+		restorerOpts = append(restorerOpts, recovery.WithTUNRecoveryOps(tunRecoveryBridge{ctrl: tunCtrl}))
+	}
+	restorer := recovery.NewRestorer(recStore, sysProx, restorerOpts...)
+
+	var clientEngine *sshclient.Client
+	var engine sshclient.Engine
+	if engineOverride != nil {
+		engine = engineOverride
+	} else {
+		clientEngine = sshclient.NewClient()
+		engine = clientEngine
+	}
+
+	emitter := &recordingEmitter{}
+	scrubber := NewSecretScrubber()
+	logBuf := NewLogBuffer(DefaultLogBufferCapacity)
+
+	h := &appHarness{
+		dir:       dir,
+		profiles:  profStore,
+		secrets:   secStore,
+		engine:    clientEngine,
+		sysProxy:  sysProx,
+		recStore:  fileRecStore,
+		restorer:  restorer,
+		emitter:   emitter,
+		scrubber:  scrubber,
+		logBuf:    logBuf,
+		stderrBuf: &bytes.Buffer{},
+	}
+
+	lw := &lockedBuffer{mu: &h.stderrMu, buf: h.stderrBuf}
+	downstream := slog.NewTextHandler(lw, &slog.HandlerOptions{Level: slog.LevelDebug})
+	handler := NewRedactingHandler(downstream, scrubber, logBuf, func(entry LogEntryDTO) {
+		emitter.Emit("tunnel:log", entry)
+	})
+	h.logger = slog.New(handler)
+
+	svc, err := NewAppService(Config{
+		Profiles: profStore,
+		Secrets:  secStore,
+		Engine:   engine,
+		ProxyConfig: proxy.Config{
+			SOCKSAddr:        "127.0.0.1:0",
+			HTTPAddr:         "127.0.0.1:0",
+			HandshakeTimeout: 3 * time.Second,
+		},
+		SysProxy:            sysProx,
+		Restorer:            restorer,
+		TUN:                 tunCtrl,
+		ResolvePeerIP:       resolveFn,
+		EnablePersistentTUN: enableCapFn,
+		Emitter:             emitter,
+		Scrubber:            scrubber,
+		LogBuffer:           logBuf,
+		Logger:              h.logger,
+		StatsInterval:       statsInterval,
+	})
+	if err != nil {
+		t.Fatalf("NewAppService: %v", err)
+	}
+	h.svc = svc
+	t.Cleanup(func() {
+		svc.Shutdown(context.Background())
+	})
+	return h
+}
+
+func TestAppService_Milestone2TUNBootstrapAndEnablePersistentAccess(t *testing.T) {
+	ctx := context.Background()
+
+	// 1. TUN == nil keeps Milestone 1 contract.
+	m1 := newAppHarness(t, time.Second)
+	m1.svc.Startup(ctx)
+	if _, err := m1.svc.EnablePersistentTUNAccess(); err == nil || !strings.Contains(err.Error(), "not enabled") {
+		t.Fatalf("EnablePersistentTUNAccess (tun=nil) = %v, want not enabled error", err)
+	}
+
+	// 2. TUN != nil with Supported=false reports Milestone 1 and TUNEnabled=false.
+	unsupportedCtrl := newMockTUNSessionController()
+	unsupportedCtrl.caps.Supported = false
+	unsupportedCtrl.caps.CanEnablePersistentCap = false
+	hUnsupported := newTUNAppHarness(t, time.Second, unsupportedCtrl, nil, nil, nil, nil)
+	hUnsupported.svc.Startup(ctx)
+	bootUnsupported, err := hUnsupported.svc.GetBootstrapState()
+	if err != nil {
+		t.Fatalf("GetBootstrapState unsupported: %v", err)
+	}
+	if bootUnsupported.Milestone != 1 || bootUnsupported.TUNEnabled {
+		t.Fatalf("expected Milestone=1, TUNEnabled=false for unsupported TUN, got %+v", bootUnsupported)
+	}
+
+	// 3. TUN supported reports Milestone 2, TUNEnabled=true, TUNCaps.
+	tunCtrl := newMockTUNSessionController()
+	var hookCalls atomic.Int32
+	var hookHadDeadline atomic.Bool
+	var hookErr error
+	h := newTUNAppHarness(t, time.Second, tunCtrl, nil, func(callCtx context.Context) error {
+		hookCalls.Add(1)
+		if dl, ok := callCtx.Deadline(); ok && time.Until(dl) > 10*time.Second {
+			hookHadDeadline.Store(true)
+		}
+		return hookErr
+	}, nil, nil)
+	h.svc.Startup(ctx)
+
+	boot, err := h.svc.GetBootstrapState()
+	if err != nil {
+		t.Fatalf("GetBootstrapState: %v", err)
+	}
+	if boot.Milestone != 2 || !boot.TUNEnabled {
+		t.Fatalf("expected Milestone=2, TUNEnabled=true, got %+v", boot)
+	}
+	if !boot.TUNCaps.Supported || boot.TUNCaps.IfaceName != splitroute.TUNIfaceName || boot.TUNCaps.TUNDNS != splitroute.TUNDNSServer {
+		t.Fatalf("unexpected TUNCaps: %+v", boot.TUNCaps)
+	}
+
+	// Success case invokes hook with bounded timeout (~30s).
+	msg, err := h.svc.EnablePersistentTUNAccess()
+	if err != nil {
+		t.Fatalf("EnablePersistentTUNAccess success: %v", err)
+	}
+	if hookCalls.Load() != 1 || !hookHadDeadline.Load() {
+		t.Fatalf("expected hook called once with >10s deadline (calls=%d, deadline=%v)", hookCalls.Load(), hookHadDeadline.Load())
+	}
+	if !strings.Contains(msg, "Restart tunssh") {
+		t.Fatalf("unexpected success message: %q", msg)
+	}
+
+	// Hook failure propagates error.
+	hookErr = errors.New("pkexec dismissed")
+	if _, err := h.svc.EnablePersistentTUNAccess(); err == nil || !strings.Contains(err.Error(), "pkexec dismissed") {
+		t.Fatalf("expected hook error, got %v", err)
+	}
+
+	// Already persistent skips hook.
+	tunCtrl.mu.Lock()
+	tunCtrl.caps.HasPersistentCap = true
+	tunCtrl.mu.Unlock()
+	alreadyMsg, err := h.svc.EnablePersistentTUNAccess()
+	if err != nil || !strings.Contains(alreadyMsg, "already active") {
+		t.Fatalf("HasPersistentCap = (%q, %v), want already active", alreadyMsg, err)
+	}
+	if hookCalls.Load() != 2 {
+		t.Fatalf("expected hook not called when HasPersistentCap=true, calls=%d", hookCalls.Load())
+	}
+
+	// Platform without CanEnablePersistentCap returns error without invoking hook.
+	tunCtrl.mu.Lock()
+	tunCtrl.caps.HasPersistentCap = false
+	tunCtrl.caps.CanEnablePersistentCap = false
+	tunCtrl.mu.Unlock()
+	if _, err := h.svc.EnablePersistentTUNAccess(); err == nil || !strings.Contains(err.Error(), "not available") {
+		t.Fatalf("CanEnablePersistentCap=false = %v, want not available error", err)
+	}
+	if hookCalls.Load() != 2 {
+		t.Fatalf("expected hook not called when CanEnablePersistentCap=false, calls=%d", hookCalls.Load())
+	}
+}
+
+func TestAppService_Milestone2TUNEndToEndTOFUOrderingStatsBypassAndDisconnect(t *testing.T) {
+	ctx := context.Background()
+	const (
+		vaultPass = "VaultPass!M2Test1"
+		sshUser   = "tunm2"
+		sshPass   = "SecretM2!Pass9"
+	)
+
+	hostSigner := generateTestEd25519Signer(t)
+	sshSrv := startInMemoryPAMSSHServer(t, sshUser, sshPass, hostSigner)
+
+	tunCtrl := newMockTUNSessionController()
+	var resolvedHosts []string
+	var resolveMu sync.Mutex
+	resolveFn := func(_ context.Context, host string) (netip.Addr, error) {
+		resolveMu.Lock()
+		resolvedHosts = append(resolvedHosts, host)
+		resolveMu.Unlock()
+		return netip.MustParseAddr(sshSrv.host), nil
+	}
+
+	h := newTUNAppHarness(t, 20*time.Millisecond, tunCtrl, resolveFn, nil, nil, nil)
+	h.svc.Startup(ctx)
+	if err := h.svc.UnlockVault(vaultPass); err != nil {
+		t.Fatalf("UnlockVault: %v", err)
+	}
+
+	// Save profile with logical hostname (different from DialHost 127.0.0.1) and PreferredMode="proxy"
+	// so we also verify TrustHostKeyAndConnect preserves the explicit "tun" mode from failed Connect!
+	prof, err := h.svc.SaveProfile(SaveProfileRequest{
+		Name:          "M2-TUN-VPS",
+		Host:          "vpn.example.test",
+		Port:          sshSrv.port,
+		Username:      sshUser,
+		AuthType:      string(profile.AuthPassword),
+		BypassIranLAN: true,
+		PreferredMode: string(profile.ModeProxy),
+		Password:      sshPass,
+	})
+	if err != nil {
+		t.Fatalf("SaveProfile: %v", err)
+	}
+
+	// 1. First Connect(id, "tun") hits TOFU using prof.Host while dialing vpsIP (127.0.0.1).
+	err = h.svc.Connect(prof.ID, string(profile.ModeTUN))
+	var untrusted *sshclient.ErrHostKeyUntrusted
+	if !errors.As(err, &untrusted) {
+		t.Fatalf("expected ErrHostKeyUntrusted, got %v", err)
+	}
+	prompts := h.emitter.EventsNamed("tunnel:hostkey_prompt")
+	if len(prompts) != 1 {
+		t.Fatalf("hostkey_prompt count = %d, want 1", len(prompts))
+	}
+	promptDTO := prompts[0].data.(HostKeyPromptDTO)
+	if promptDTO.Host != "vpn.example.test" || promptDTO.Port != sshSrv.port {
+		t.Fatalf("TOFU prompt host:port = %s:%d, want vpn.example.test:%d", promptDTO.Host, promptDTO.Port, sshSrv.port)
+	}
+	tunCtrl.mu.Lock()
+	prepAfterTOFU := tunCtrl.prepareCalls
+	startAfterTOFU := tunCtrl.startCalls
+	stopAfterTOFU := tunCtrl.stopCalls
+	tunCtrl.mu.Unlock()
+	if prepAfterTOFU != 1 || startAfterTOFU != 0 || stopAfterTOFU != 1 {
+		t.Fatalf("unexpected TUN calls after TOFU failure: prep=%d start=%d stop=%d", prepAfterTOFU, startAfterTOFU, stopAfterTOFU)
+	}
+	if rec, loadErr := h.recStore.Load(); loadErr != nil || (rec != nil && rec.Dirty) {
+		t.Fatalf("expected clean recovery_state.json after TOFU failure, got %+v (err=%v)", rec, loadErr)
+	}
+
+	// 2. Verify ordering invariant: BeginTUNSession writes dirty:true, mode:"tun" strictly BEFORE StartTUN.
+	var (
+		recBeforeStart *recovery.RecoveryState
+		recLoadErr     error
+		dialerNonNil   bool
+	)
+	tunCtrl.mu.Lock()
+	tunCtrl.onStart = func(_ context.Context, req TUNStartRequest, dialer sshclient.TunnelDialer) {
+		recBeforeStart, recLoadErr = h.recStore.Load()
+		dialerNonNil = dialer != nil
+	}
+	tunCtrl.stats = tun.Stats{
+		Running:   true,
+		IfaceName: splitroute.TUNIfaceName,
+		RxBytes:   4096,
+		TxBytes:   2048,
+	}
+	tunCtrl.mu.Unlock()
+
+	if err := h.svc.TrustHostKeyAndConnect(prof.ID, promptDTO.Algorithm, promptDTO.SHA256); err != nil {
+		t.Fatalf("TrustHostKeyAndConnect: %v", err)
+	}
+	if recLoadErr != nil || recBeforeStart == nil || !recBeforeStart.Dirty || recBeforeStart.Mode != recovery.RecoveryModeTUN || recBeforeStart.TUNSnapshot == nil {
+		t.Fatalf("BeginTUNSession did not persist dirty TUN state before StartTUN: %+v (err=%v)", recBeforeStart, recLoadErr)
+	}
+	if recBeforeStart.TUNSnapshot.VPSPeerIP != "127.0.0.1" {
+		t.Fatalf("expected VPSPeerIP=127.0.0.1 in recovery snapshot, got %+v", recBeforeStart.TUNSnapshot)
+	}
+	if !dialerNonNil {
+		t.Fatalf("expected non-nil TunnelDialer passed to StartTUN")
+	}
+
+	resolveMu.Lock()
+	if len(resolvedHosts) != 2 || resolvedHosts[0] != "vpn.example.test" || resolvedHosts[1] != "vpn.example.test" {
+		t.Fatalf("resolvedHosts = %v, want [vpn.example.test vpn.example.test]", resolvedHosts)
+	}
+	resolveMu.Unlock()
+
+	bootConn, err := h.svc.GetBootstrapState()
+	if err != nil {
+		t.Fatalf("GetBootstrapState: %v", err)
+	}
+	if bootConn.Status.State != string(sshclient.StateConnected) || bootConn.Status.Mode != string(profile.ModeTUN) {
+		t.Fatalf("expected connected/tun status, got state=%q mode=%q", bootConn.Status.State, bootConn.Status.Mode)
+	}
+	if enableCalls, _, _, _ := h.sysProxy.Stats(); enableCalls != 0 {
+		t.Fatalf("expected 0 sysProxy.Enable calls in TUN mode, got %d", enableCalls)
+	}
+
+	// Verify connection summary log includes tunssh0 and 198.18.0.2.
+	logsText := h.svc.ExportRedactedLogs()
+	if !strings.Contains(logsText, splitroute.TUNIfaceName) || !strings.Contains(logsText, splitroute.TUNDNSServer) {
+		t.Fatalf("expected TUN summary log containing %s and %s, got:\n%s", splitroute.TUNIfaceName, splitroute.TUNDNSServer, logsText)
+	}
+
+	// Wait for tunnel:stats and verify TUN stats are merged.
+	deadline := time.Now().Add(2 * time.Second)
+	for h.emitter.Count("tunnel:stats") == 0 && time.Now().Before(deadline) {
+		time.Sleep(15 * time.Millisecond)
+	}
+	statsEvs := h.emitter.EventsNamed("tunnel:stats")
+	if len(statsEvs) == 0 {
+		t.Fatalf("expected tunnel:stats emission in TUN mode")
+	}
+	lastStats := statsEvs[len(statsEvs)-1].data.(TunnelStatusDTO)
+	if lastStats.Mode != string(profile.ModeTUN) || lastStats.RxBytes < 4096 || lastStats.TxBytes < 2048 {
+		t.Fatalf("expected merged TUN stats in tunnel:stats, got %+v", lastStats)
+	}
+
+	// 3. SetBypassIranLAN updates live TUN bypass and rolls back profiles.json on failure.
+	updatedView, err := h.svc.SetBypassIranLAN(prof.ID, false)
+	if err != nil || updatedView.BypassIranLAN {
+		t.Fatalf("SetBypassIranLAN(false) = (%+v, %v)", updatedView, err)
+	}
+	tunCtrl.mu.Lock()
+	tunCtrl.setBypassErr = errors.New("netlink bypass update failed")
+	tunCtrl.mu.Unlock()
+	if _, err := h.svc.SetBypassIranLAN(prof.ID, true); err == nil {
+		t.Fatalf("expected SetBypassIranLAN(true) failure")
+	}
+	persistedProf, err := h.profiles.Get(ctx, prof.ID)
+	if err != nil {
+		t.Fatalf("profiles.Get: %v", err)
+	}
+	if persistedProf.BypassIranLAN {
+		t.Fatalf("expected BypassIranLAN rolled back to false on SetBypass failure")
+	}
+
+	// 4. Disconnect stops TUN, marks recovery clean, clears activeTUN, stops stats.
+	if err := h.svc.Disconnect(); err != nil {
+		t.Fatalf("Disconnect: %v", err)
+	}
+	tunCtrl.mu.Lock()
+	stopsAfterDisconn := tunCtrl.stopCalls
+	bypassCalls := append([]bool(nil), tunCtrl.bypassCalls...)
+	tunCtrl.mu.Unlock()
+	if stopsAfterDisconn != 2 {
+		t.Fatalf("tun.Stop calls = %d, want 2 (1 TOFU failure + 1 Disconnect)", stopsAfterDisconn)
+	}
+	if len(bypassCalls) != 2 || bypassCalls[0] != false || bypassCalls[1] != true {
+		t.Fatalf("bypassCalls = %v, want [false true]", bypassCalls)
+	}
+	if rec, loadErr := h.recStore.Load(); loadErr != nil || rec == nil || rec.Dirty {
+		t.Fatalf("expected clean recovery_state.json after Disconnect, got %+v (err=%v)", rec, loadErr)
+	}
+	if st, _ := h.svc.GetBootstrapState(); st.Status.State != string(sshclient.StateDisconnected) {
+		t.Fatalf("expected disconnected after Disconnect, got %q", st.Status.State)
+	}
+	countAtDisconn := h.emitter.Count("tunnel:stats")
+	time.Sleep(70 * time.Millisecond)
+	if h.emitter.Count("tunnel:stats") != countAtDisconn {
+		t.Fatalf("expected zero trailing tunnel:stats after Disconnect")
+	}
+
+	// 5. Verify TrustHostKeyAndConnect on a fresh service with PreferredMode="tun" defaults to "tun" without prior Connect.
+	tunCtrl2 := newMockTUNSessionController()
+	h2 := newTUNAppHarness(t, time.Second, tunCtrl2, resolveFn, nil, nil, nil)
+	h2.svc.Startup(ctx)
+	if err := h2.svc.UnlockVault(vaultPass); err != nil {
+		t.Fatalf("UnlockVault h2: %v", err)
+	}
+	profPrefTUN, err := h2.svc.SaveProfile(SaveProfileRequest{
+		Name:          "Pref-TUN",
+		Host:          "vpn.example.test",
+		Port:          sshSrv.port,
+		Username:      sshUser,
+		AuthType:      string(profile.AuthPassword),
+		BypassIranLAN: true,
+		PreferredMode: string(profile.ModeTUN),
+		Password:      sshPass,
+	})
+	if err != nil {
+		t.Fatalf("SaveProfile h2: %v", err)
+	}
+	if err := h2.svc.TrustHostKeyAndConnect(profPrefTUN.ID, promptDTO.Algorithm, promptDTO.SHA256); err != nil {
+		t.Fatalf("TrustHostKeyAndConnect PreferredMode=tun: %v", err)
+	}
+	if st, _ := h2.svc.GetBootstrapState(); st.Status.Mode != string(profile.ModeTUN) || st.Status.State != string(sshclient.StateConnected) {
+		t.Fatalf("expected TrustHostKeyAndConnect to honor PreferredMode=tun, got %+v", st.Status)
+	}
+
+	// 6. Switching from active TUN -> Proxy stops TUN, restores TUN recovery, and activates proxy.
+	profSwitch, err := h2.svc.SaveProfile(SaveProfileRequest{
+		Name:          "Switch-TUN-Proxy",
+		Host:          sshSrv.host,
+		Port:          sshSrv.port,
+		Username:      sshUser,
+		AuthType:      string(profile.AuthPassword),
+		BypassIranLAN: true,
+		PreferredMode: string(profile.ModeTUN),
+		Password:      sshPass,
+	})
+	if err != nil {
+		t.Fatalf("SaveProfile switch: %v", err)
+	}
+	if err := h2.svc.TrustHostKeyAndConnect(profSwitch.ID, promptDTO.Algorithm, promptDTO.SHA256); err != nil {
+		t.Fatalf("TrustHostKeyAndConnect switch profile (TUN): %v", err)
+	}
+	tunCtrl2.mu.Lock()
+	tunStopsBeforeSwitch := tunCtrl2.stopCalls
+	tunCtrl2.mu.Unlock()
+	if tunStopsBeforeSwitch != 1 {
+		t.Fatalf("expected tun.Stop called once on TUN -> TUN profile switch, got %d", tunStopsBeforeSwitch)
+	}
+	if err := h2.svc.Connect(profSwitch.ID, string(profile.ModeProxy)); err != nil {
+		t.Fatalf("switch TUN -> Proxy: %v", err)
+	}
+	tunCtrl2.mu.Lock()
+	tunStopsAfterSwitch := tunCtrl2.stopCalls
+	tunCtrl2.mu.Unlock()
+	if tunStopsAfterSwitch != 2 {
+		t.Fatalf("expected tun.Stop called again on TUN -> Proxy switch, got %d", tunStopsAfterSwitch)
+	}
+	if st, _ := h2.svc.GetBootstrapState(); st.Status.Mode != string(profile.ModeProxy) || st.Status.State != string(sshclient.StateConnected) {
+		t.Fatalf("expected connected/proxy after mode switch, got %+v", st.Status)
+	}
+	if rec, loadErr := h2.recStore.Load(); loadErr != nil || rec == nil || !rec.Dirty || rec.Mode != recovery.RecoveryModeProxy {
+		t.Fatalf("expected dirty proxy recovery state after mode switch, got %+v (err=%v)", rec, loadErr)
+	}
+}
+
+func TestAppService_Milestone2TUNConnectDialControlAndRollbacks(t *testing.T) {
+	ctx := context.Background()
+
+	// 1. Verify DialHost, DialControl attachment, and InstalledRoutes population with recordingSSHEngine.
+	tunCtrl := newMockTUNSessionController()
+	tunCtrl.caps.RequiresElevation = false
+	var (
+		recAtStart    *recovery.RecoveryState
+		recAtStartErr error
+	)
+	recEng := &recordingSSHEngine{}
+	resolveFn := func(context.Context, string) (netip.Addr, error) {
+		return netip.MustParseAddr("203.0.113.10"), nil
+	}
+	h := newTUNAppHarness(t, 20*time.Millisecond, tunCtrl, resolveFn, nil, nil, recEng)
+	tunCtrl.mu.Lock()
+	tunCtrl.onStart = func(context.Context, TUNStartRequest, sshclient.TunnelDialer) {
+		recAtStart, recAtStartErr = h.recStore.Load()
+	}
+	tunCtrl.mu.Unlock()
+	h.svc.Startup(ctx)
+	if err := h.svc.UnlockVault("VaultPass!M2Ctrl"); err != nil {
+		t.Fatalf("UnlockVault: %v", err)
+	}
+	prof, err := h.svc.SaveProfile(SaveProfileRequest{
+		Name:          "DialControl-Check",
+		Host:          "edge.example.com",
+		Port:          2222,
+		Username:      "u",
+		AuthType:      string(profile.AuthPassword),
+		BypassIranLAN: true,
+		PreferredMode: string(profile.ModeTUN),
+		Password:      "pw",
+	})
+	if err != nil {
+		t.Fatalf("SaveProfile: %v", err)
+	}
+	if err := h.svc.Connect(prof.ID, string(profile.ModeTUN)); err != nil {
+		t.Fatalf("Connect(tun) with recordingSSHEngine: %v", err)
+	}
+	if recAtStartErr != nil || recAtStart == nil || !recAtStart.Dirty || recAtStart.Mode != recovery.RecoveryModeTUN || recAtStart.TUNSnapshot == nil {
+		t.Fatalf("expected dirty TUN recovery snapshot before StartTUN, got %+v (err=%v)", recAtStart, recAtStartErr)
+	}
+	if recAtStart.TUNSnapshot.VPSPeerIP != "203.0.113.10" || !slices.Contains(recAtStart.TUNSnapshot.InstalledRoutes, "203.0.113.10/32") || !slices.Contains(recAtStart.TUNSnapshot.InstalledRoutes, "0.0.0.0/1") {
+		t.Fatalf("expected InstalledRoutes populated for 203.0.113.10, got %+v", recAtStart.TUNSnapshot)
+	}
+	recEng.mu.Lock()
+	if len(recEng.connectCfgs) != 1 {
+		recEng.mu.Unlock()
+		t.Fatalf("expected 1 ConnectConfig, got %d", len(recEng.connectCfgs))
+	}
+	cfg1 := recEng.connectCfgs[0]
+	recEng.mu.Unlock()
+	if cfg1.Host != "edge.example.com" || cfg1.DialHost != "203.0.113.10" || cfg1.DialControl == nil {
+		t.Fatalf("unexpected ConnectConfig for direct TUN: Host=%q DialHost=%q DialControl=%v", cfg1.Host, cfg1.DialHost, cfg1.DialControl != nil)
+	}
+
+	// Runtime StateError tears down active TUN and marks recovery clean.
+	recEng.EmitSnapshot(sshclient.EngineSnapshot{
+		State:     sshclient.StateError,
+		ProfileID: prof.ID,
+		Host:      prof.Host,
+		Port:      prof.Port,
+		LastError: &sshclient.MappedError{Code: "AUTH_FAILED", Message: "auth failed", Retryable: false},
+	})
+	tunCtrl.mu.Lock()
+	stopsAfterErr := tunCtrl.stopCalls
+	tunCtrl.mu.Unlock()
+	if stopsAfterErr != 1 {
+		t.Fatalf("expected tun.Stop called on runtime StateError, got %d", stopsAfterErr)
+	}
+	if rec, loadErr := h.recStore.Load(); loadErr != nil || rec == nil || rec.Dirty {
+		t.Fatalf("expected clean recovery_state.json after StateError teardown, got %+v (err=%v)", rec, loadErr)
+	}
+
+	// 2. StartTUN failure rolls back TUN.Stop, marks recovery clean, and disconnects SSH.
+	tunCtrl.mu.Lock()
+	tunCtrl.caps.RequiresElevation = true
+	tunCtrl.startErr = errors.New("wintun open failed")
+	tunCtrl.mu.Unlock()
+	if err := h.svc.Connect(prof.ID, string(profile.ModeTUN)); err == nil || !strings.Contains(err.Error(), "wintun open failed") {
+		t.Fatalf("expected StartTUN failure, got %v", err)
+	}
+	recEng.mu.Lock()
+	cfg2 := recEng.connectCfgs[1]
+	disconnCallsAfterStartFail := recEng.disconnCalls
+	recEng.mu.Unlock()
+	if cfg2.DialControl != nil {
+		t.Fatalf("expected nil DialControl when RequiresElevation=true")
+	}
+	if disconnCallsAfterStartFail == 0 {
+		t.Fatalf("expected engine.Disconnect called on StartTUN failure")
+	}
+	if rec, loadErr := h.recStore.Load(); loadErr != nil || rec == nil || rec.Dirty {
+		t.Fatalf("expected clean recovery_state.json after StartTUN rollback, got %+v (err=%v)", rec, loadErr)
+	}
+	if st, _ := h.svc.GetBootstrapState(); st.Status.State != string(sshclient.StateDisconnected) {
+		t.Fatalf("expected disconnected after StartTUN failure, got %q", st.Status.State)
+	}
+
+	// 3. BeginTUNSession failure rolls back TUN.Stop and disconnects SSH without calling StartTUN.
+	tunCtrlFailBegin := newMockTUNSessionController()
+	recEngFailBegin := &recordingSSHEngine{}
+	rawDir := t.TempDir()
+	baseRec, err := recovery.NewFileRecoveryStore(rawDir)
+	if err != nil {
+		t.Fatalf("NewFileRecoveryStore: %v", err)
+	}
+	faultRec := &faultRecoveryStore{inner: baseRec, saveDirtyErr: errors.New("disk full")}
+	hFailBegin := newTUNAppHarness(t, time.Second, tunCtrlFailBegin, resolveFn, nil, faultRec, recEngFailBegin)
+	hFailBegin.svc.Startup(ctx)
+	_ = hFailBegin.svc.UnlockVault("VaultPass!BeginFail")
+	profFB, err := hFailBegin.svc.SaveProfile(SaveProfileRequest{
+		Name:          "BeginFail",
+		Host:          "edge.example.com",
+		Port:          22,
+		Username:      "u",
+		AuthType:      string(profile.AuthPassword),
+		PreferredMode: string(profile.ModeTUN),
+		Password:      "pw",
+	})
+	if err != nil {
+		t.Fatalf("SaveProfile failBegin: %v", err)
+	}
+	if err := hFailBegin.svc.Connect(profFB.ID, string(profile.ModeTUN)); err == nil || !strings.Contains(err.Error(), "disk full") {
+		t.Fatalf("expected BeginTUNSession failure, got %v", err)
+	}
+	tunCtrlFailBegin.mu.Lock()
+	if tunCtrlFailBegin.startCalls != 0 || tunCtrlFailBegin.stopCalls != 1 {
+		t.Fatalf("expected startCalls=0 stopCalls=1 on BeginTUNSession failure, got start=%d stop=%d", tunCtrlFailBegin.startCalls, tunCtrlFailBegin.stopCalls)
+	}
+	tunCtrlFailBegin.mu.Unlock()
+	recEngFailBegin.mu.Lock()
+	if recEngFailBegin.disconnCalls != 1 {
+		t.Fatalf("expected engine.Disconnect on BeginTUNSession failure, got %d", recEngFailBegin.disconnCalls)
+	}
+	recEngFailBegin.mu.Unlock()
+
+	// 4. Concurrent Disconnect cancels slow in-flight Connect(id, "tun").
+	tunCtrlSlow := newMockTUNSessionController()
+	prepStarted := make(chan struct{})
+	tunCtrlSlow.onPrepare = func(prepCtx context.Context) {
+		close(prepStarted)
+		<-prepCtx.Done()
+	}
+	hSlow := newTUNAppHarness(t, time.Second, tunCtrlSlow, resolveFn, nil, nil, nil)
+	hSlow.svc.Startup(ctx)
+	_ = hSlow.svc.UnlockVault("VaultPass!SlowTUN")
+	profSlow, err := hSlow.svc.SaveProfile(SaveProfileRequest{
+		Name:          "SlowTUN",
+		Host:          "127.0.0.1",
+		Port:          22,
+		Username:      "u",
+		AuthType:      string(profile.AuthPassword),
+		PreferredMode: string(profile.ModeTUN),
+		Password:      "pw",
+	})
+	if err != nil {
+		t.Fatalf("SaveProfile slowTUN: %v", err)
+	}
+	connErrCh := make(chan error, 1)
+	go func() {
+		connErrCh <- hSlow.svc.Connect(profSlow.ID, string(profile.ModeTUN))
+	}()
+	select {
+	case <-prepStarted:
+	case <-time.After(2 * time.Second):
+		t.Fatalf("timed out waiting for PrepareSession")
+	}
+	if err := hSlow.svc.Disconnect(); err != nil {
+		t.Fatalf("Disconnect during PrepareSession: %v", err)
+	}
+	select {
+	case err := <-connErrCh:
+		if err == nil {
+			t.Fatalf("expected canceled Connect(tun) error")
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatalf("Connect(tun) hung after Disconnect")
+	}
+}
+
+func TestAppService_Milestone2TUNStartupRecovery(t *testing.T) {
+	ctx := context.Background()
+
+	// Case (a): Dirty TUN state on startup when IsActiveOnOS returns false -> auto-cleaned.
+	tunInactive := newMockTUNSessionController()
+	tunInactive.isActiveOnOS = false
+	h1 := newTUNAppHarness(t, time.Second, tunInactive, nil, nil, nil, nil)
+	if err := h1.recStore.SaveDirty(recovery.RecoveryState{
+		Mode: recovery.RecoveryModeTUN,
+		PID:  os.Getpid() + 40000,
+		TUNSnapshot: &recovery.TUNSnapshot{
+			VPSPeerIP:     "203.0.113.10",
+			OrigGateway:   "192.168.1.1",
+			OrigIfaceName: "eth0",
+			TUNIfaceName:  splitroute.TUNIfaceName,
+		},
+	}); err != nil {
+		t.Fatalf("SaveDirty case a: %v", err)
+	}
+
+	h1.svc.Startup(ctx)
+	ev1 := h1.emitter.EventsNamed("tunnel:recovery")
+	if len(ev1) != 1 {
+		t.Fatalf("expected 1 tunnel:recovery event in case a, got %d", len(ev1))
+	}
+	dto1 := ev1[0].data.(StartupRecoveryDTO)
+	if !dto1.Recovered || dto1.NeedsElevation || dto1.Mode != recovery.RecoveryModeTUN {
+		t.Fatalf("unexpected StartupRecoveryDTO for inactive OS TUN: %+v", dto1)
+	}
+	if rec, err := h1.recStore.Load(); err != nil || rec.Dirty {
+		t.Fatalf("expected recovery_state.json marked clean automatically, got %+v (err=%v)", rec, err)
+	}
+
+	// Case (b): Dirty TUN state on startup when IsActiveOnOS returns true -> NeedsElevation, then RestoreNetwork restores + cleans.
+	tunActive := newMockTUNSessionController()
+	tunActive.isActiveOnOS = true
+	h2 := newTUNAppHarness(t, time.Second, tunActive, nil, nil, nil, nil)
+	if err := h2.recStore.SaveDirty(recovery.RecoveryState{
+		Mode: recovery.RecoveryModeTUN,
+		PID:  os.Getpid() + 40001,
+		TUNSnapshot: &recovery.TUNSnapshot{
+			VPSPeerIP:       "203.0.113.10",
+			OrigGateway:     "192.168.1.1",
+			OrigIfaceName:   "eth0",
+			OrigIfaceIndex:  2,
+			TUNIfaceName:    splitroute.TUNIfaceName,
+			InstalledRoutes: []string{"203.0.113.10/32", "0.0.0.0/1", "128.0.0.0/1"},
+		},
+	}); err != nil {
+		t.Fatalf("SaveDirty case b: %v", err)
+	}
+
+	h2.svc.Startup(ctx)
+	ev2 := h2.emitter.EventsNamed("tunnel:recovery")
+	if len(ev2) != 1 {
+		t.Fatalf("expected 1 tunnel:recovery event in case b, got %d", len(ev2))
+	}
+	dto2 := ev2[0].data.(StartupRecoveryDTO)
+	if dto2.Recovered || !dto2.NeedsElevation || dto2.Mode != recovery.RecoveryModeTUN {
+		t.Fatalf("unexpected StartupRecoveryDTO for active OS TUN: %+v", dto2)
+	}
+	if rec, err := h2.recStore.Load(); err != nil || !rec.Dirty {
+		t.Fatalf("expected recovery_state.json still dirty before RestoreNetwork, got %+v (err=%v)", rec, err)
+	}
+
+	if err := h2.svc.RestoreNetwork(); err != nil {
+		t.Fatalf("RestoreNetwork: %v", err)
+	}
+	tunActive.mu.Lock()
+	restoreCalls := tunActive.restoreCalls
+	restoredSnaps := append([]splitroute.NetworkSnapshot(nil), tunActive.restoredSnaps...)
+	tunActive.mu.Unlock()
+	if restoreCalls != 1 || len(restoredSnaps) != 1 || restoredSnaps[0].VPSPeerIP != "203.0.113.10" {
+		t.Fatalf("expected RestoreFromSnapshot called once with VPSPeerIP=203.0.113.10, got calls=%d snaps=%+v", restoreCalls, restoredSnaps)
+	}
+	if rec, err := h2.recStore.Load(); err != nil || rec.Dirty {
+		t.Fatalf("expected recovery_state.json clean after RestoreNetwork, got %+v (err=%v)", rec, err)
+	}
+	bootAfterRestore, err := h2.svc.GetBootstrapState()
+	if err != nil {
+		t.Fatalf("GetBootstrapState after RestoreNetwork: %v", err)
+	}
+	if bootAfterRestore.Recovery == nil || !bootAfterRestore.Recovery.Recovered || bootAfterRestore.Recovery.NeedsElevation {
+		t.Fatalf("expected updated Recovery banner state after RestoreNetwork, got %+v", bootAfterRestore.Recovery)
+	}
+}
+
+func TestAppService_HelperSingleElevationPerSessionAndCleanRollback(t *testing.T) {
+	ctx := context.Background()
+	const (
+		sshUser = "singleuac"
+		sshPass = "SingleUAC!Pass1"
+	)
+
+	makePipeHelper := func(helperCtrl TUNSessionController) (*funcHelperLauncher, <-chan error) {
+		helperDone := make(chan error, 4)
+		launcher := &funcHelperLauncher{
+			launchFn: func(_ context.Context) (io.ReadWriteCloser, func(), error) {
+				guiConn, helperConn := net.Pipe()
+				go func() {
+					helperDone <- RunHelperOnConn(context.Background(), helperConn, helperCtrl, discardLogger())
+				}()
+				return guiConn, func() { _ = guiConn.Close() }, nil
+			},
+		}
+		return launcher, helperDone
+	}
+
+	savePinnedTUNProfile := func(t *testing.T, h *appHarness, name, host string, port int, hostSigner ssh.Signer) ProfileView {
+		t.Helper()
+		view, err := h.svc.SaveProfile(SaveProfileRequest{
+			Name:          name,
+			Host:          host,
+			Port:          port,
+			Username:      sshUser,
+			AuthType:      string(profile.AuthPassword),
+			PreferredMode: string(profile.ModeTUN),
+			Password:      sshPass,
+		})
+		if err != nil {
+			t.Fatalf("SaveProfile: %v", err)
+		}
+		p, err := h.profiles.Get(ctx, view.ID)
+		if err != nil {
+			t.Fatalf("profiles.Get: %v", err)
+		}
+		p.PinnedHostKey = &profile.HostKeyPin{
+			Algorithm: hostSigner.PublicKey().Type(),
+			SHA256:    ssh.FingerprintSHA256(hostSigner.PublicKey()),
+		}
+		if _, err := h.profiles.Save(ctx, p); err != nil {
+			t.Fatalf("profiles.Save pin: %v", err)
+		}
+		return view
+	}
+
+	t.Run("PrepareSession -> StartTUN -> Disconnect uses exactly 1 helper launch", func(t *testing.T) {
+		hostSigner := generateTestEd25519Signer(t)
+		sshSrv := startInMemoryPAMSSHServer(t, sshUser, sshPass, hostSigner)
+
+		helperMock := newMockTUNSessionController()
+		helperMock.stats = tun.Stats{Running: true, IfaceName: splitroute.TUNIfaceName}
+		helperMock.onStop = func(context.Context) {
+			helperMock.mu.Lock()
+			helperMock.stats.Running = false
+			helperMock.mu.Unlock()
+		}
+		launcher, helperDone := makePipeHelper(helperMock)
+		guiCtrl := newHelperTUNController(
+			TUNCapsDTO{Supported: true, RequiresElevation: true, IfaceName: splitroute.TUNIfaceName, TUNIPv4: splitroute.TUNIPv4Addr, TUNDNS: splitroute.TUNDNSServer},
+			launcher,
+			&mockRouteManager{isActive: false},
+			discardLogger(),
+		)
+
+		resolveFn := func(context.Context, string) (netip.Addr, error) {
+			return netip.MustParseAddr(sshSrv.host), nil
+		}
+		h := newTUNAppHarness(t, 50*time.Millisecond, guiCtrl, resolveFn, nil, nil, nil)
+		h.svc.Startup(ctx)
+		if err := h.svc.UnlockVault("VaultPass!Single1"); err != nil {
+			t.Fatalf("UnlockVault: %v", err)
+		}
+		prof := savePinnedTUNProfile(t, h, "SingleLaunchHappy", sshSrv.host, sshSrv.port, hostSigner)
+
+		if err := h.svc.Connect(prof.ID, string(profile.ModeTUN)); err != nil {
+			t.Fatalf("Connect(tun) error = %v", err)
+		}
+		if launcher.Calls() != 1 {
+			t.Fatalf("expected 1 helper launch after Connect, got %d", launcher.Calls())
+		}
+		if err := h.svc.Disconnect(); err != nil {
+			t.Fatalf("Disconnect error = %v", err)
+		}
+		select {
+		case err := <-helperDone:
+			if err != nil {
+				t.Fatalf("helper exited with error: %v", err)
+			}
+		case <-time.After(3 * time.Second):
+			t.Fatalf("timed out waiting for helper exit")
+		}
+		if launcher.Calls() != 1 {
+			t.Fatalf("expected NO second helper launch on Disconnect, got %d", launcher.Calls())
+		}
+		if rec, err := h.recStore.Load(); err != nil || rec == nil || rec.Dirty {
+			t.Fatalf("expected clean recovery_state.json after Disconnect, got %+v (err=%v)", rec, err)
+		}
+		helperMock.mu.Lock()
+		gotStop, gotRestore := helperMock.stopCalls, helperMock.restoreCalls
+		helperMock.mu.Unlock()
+		if gotRestore != 0 || gotStop != 1 {
+			t.Fatalf("expected helper Stop=1 Restore=0, got Stop=%d Restore=%d", gotStop, gotRestore)
+		}
+	})
+
+	t.Run("PrepareSession -> StartTUN fail -> rollback uses exactly 1 helper launch and cleans recovery", func(t *testing.T) {
+		hostSigner := generateTestEd25519Signer(t)
+		sshSrv := startInMemoryPAMSSHServer(t, sshUser, sshPass, hostSigner)
+
+		helperMock := newMockTUNSessionController()
+		helperMock.startErr = errors.New("simulated start error with clean internal rollback")
+		launcher, helperDone := makePipeHelper(helperMock)
+		guiCtrl := newHelperTUNController(
+			TUNCapsDTO{Supported: true, RequiresElevation: true, IfaceName: splitroute.TUNIfaceName, TUNIPv4: splitroute.TUNIPv4Addr, TUNDNS: splitroute.TUNDNSServer},
+			launcher,
+			&mockRouteManager{isActive: false},
+			discardLogger(),
+		)
+
+		resolveFn := func(context.Context, string) (netip.Addr, error) {
+			return netip.MustParseAddr(sshSrv.host), nil
+		}
+		h := newTUNAppHarness(t, 50*time.Millisecond, guiCtrl, resolveFn, nil, nil, nil)
+		h.svc.Startup(ctx)
+		if err := h.svc.UnlockVault("VaultPass!SingleFail"); err != nil {
+			t.Fatalf("UnlockVault: %v", err)
+		}
+		prof := savePinnedTUNProfile(t, h, "SingleLaunchFail", sshSrv.host, sshSrv.port, hostSigner)
+
+		err := h.svc.Connect(prof.ID, string(profile.ModeTUN))
+		if err == nil || !strings.Contains(err.Error(), "simulated start error") {
+			t.Fatalf("expected StartTUN error, got %v", err)
+		}
+		select {
+		case err := <-helperDone:
+			if err != nil {
+				t.Fatalf("helper exited with error: %v", err)
+			}
+		case <-time.After(3 * time.Second):
+			t.Fatalf("timed out waiting for helper exit")
+		}
+		if launcher.Calls() != 1 {
+			t.Fatalf("expected NO second helper launch on StartTUN rollback, got %d", launcher.Calls())
+		}
+		if rec, err := h.recStore.Load(); err != nil || rec == nil || rec.Dirty {
+			t.Fatalf("expected clean recovery_state.json after StartTUN rollback, got %+v (err=%v)", rec, err)
+		}
+		helperMock.mu.Lock()
+		gotRestore := helperMock.restoreCalls
+		helperMock.mu.Unlock()
+		if gotRestore != 0 {
+			t.Fatalf("expected helper RestoreFromSnapshot not called on clean rollback, got %d", gotRestore)
+		}
+	})
+
+	t.Run("Stop error or ErrTUNRollbackIncomplete triggers fallback RestoreTUNSession", func(t *testing.T) {
+		hostSigner := generateTestEd25519Signer(t)
+		sshSrv := startInMemoryPAMSSHServer(t, sshUser, sshPass, hostSigner)
+
+		// Case A: Stop returns error on Disconnect -> RestoreFromSnapshot runs via fallback launch.
+		helperMockStopErr := newMockTUNSessionController()
+		helperMockStopErr.stats = tun.Stats{Running: true, IfaceName: splitroute.TUNIfaceName}
+		helperMockStopErr.stopErr = errors.New("rpc stop failed")
+		helperMockStopErr.onStop = func(context.Context) {
+			helperMockStopErr.mu.Lock()
+			helperMockStopErr.stats.Running = false
+			helperMockStopErr.mu.Unlock()
+		}
+		launcherA, helperDoneA := makePipeHelper(helperMockStopErr)
+		guiCtrlA := newHelperTUNController(TUNCapsDTO{Supported: true, RequiresElevation: true}, launcherA, &mockRouteManager{}, discardLogger())
+
+		resolveFn := func(context.Context, string) (netip.Addr, error) {
+			return netip.MustParseAddr(sshSrv.host), nil
+		}
+		hA := newTUNAppHarness(t, 50*time.Millisecond, guiCtrlA, resolveFn, nil, nil, nil)
+		hA.svc.Startup(ctx)
+		_ = hA.svc.UnlockVault("VaultPass!FallbackA")
+		profA := savePinnedTUNProfile(t, hA, "FallbackA", sshSrv.host, sshSrv.port, hostSigner)
+		if err := hA.svc.Connect(profA.ID, string(profile.ModeTUN)); err != nil {
+			t.Fatalf("Connect FallbackA: %v", err)
+		}
+		_ = hA.svc.Disconnect()
+		for i := 0; i < 2; i++ {
+			select {
+			case <-helperDoneA:
+			case <-time.After(3 * time.Second):
+				t.Fatalf("timed out waiting for helperDoneA #%d", i)
+			}
+		}
+		helperMockStopErr.mu.Lock()
+		gotRestoreA := helperMockStopErr.restoreCalls
+		helperMockStopErr.mu.Unlock()
+		if launcherA.Calls() != 2 || gotRestoreA != 1 {
+			t.Fatalf("expected fallback launch + RestoreFromSnapshot on Stop error, got launches=%d restore=%d", launcherA.Calls(), gotRestoreA)
+		}
+		if rec, err := hA.recStore.Load(); err != nil || rec == nil || rec.Dirty {
+			t.Fatalf("expected clean recovery_state.json after fallback restore, got %+v (err=%v)", rec, err)
+		}
+
+		// Case B: StartTUN returns ErrTUNRollbackIncomplete -> RestoreFromSnapshot runs via fallback launch.
+		helperMockIncomplete := newMockTUNSessionController()
+		helperMockIncomplete.startErr = fmt.Errorf("apply fail: %w", ErrTUNRollbackIncomplete)
+		launcherB, helperDoneB := makePipeHelper(helperMockIncomplete)
+		guiCtrlB := newHelperTUNController(TUNCapsDTO{Supported: true, RequiresElevation: true}, launcherB, &mockRouteManager{}, discardLogger())
+
+		hB := newTUNAppHarness(t, 50*time.Millisecond, guiCtrlB, resolveFn, nil, nil, nil)
+		hB.svc.Startup(ctx)
+		_ = hB.svc.UnlockVault("VaultPass!FallbackB")
+		profB := savePinnedTUNProfile(t, hB, "FallbackB", sshSrv.host, sshSrv.port, hostSigner)
+		if err := hB.svc.Connect(profB.ID, string(profile.ModeTUN)); err == nil {
+			t.Fatalf("expected StartTUN error")
+		}
+		for i := 0; i < 2; i++ {
+			select {
+			case <-helperDoneB:
+			case <-time.After(3 * time.Second):
+				t.Fatalf("timed out waiting for helperDoneB #%d", i)
+			}
+		}
+		helperMockIncomplete.mu.Lock()
+		gotRestoreB := helperMockIncomplete.restoreCalls
+		helperMockIncomplete.mu.Unlock()
+		if launcherB.Calls() != 2 || gotRestoreB != 1 {
+			t.Fatalf("expected fallback launch + RestoreFromSnapshot on ErrTUNRollbackIncomplete, got launches=%d restore=%d", launcherB.Calls(), gotRestoreB)
+		}
+		if rec, err := hB.recStore.Load(); err != nil || rec == nil || rec.Dirty {
+			t.Fatalf("expected clean recovery_state.json after incomplete rollback restore, got %+v (err=%v)", rec, err)
+		}
+	})
 }

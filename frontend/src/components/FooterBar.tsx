@@ -5,6 +5,7 @@ interface FooterBarProps {
   unreadSeverity: "none" | "warn" | "error";
   unreadCount: number;
   restoringNetwork: boolean;
+  tunEnabled?: boolean;
   onToggleLogs: () => void;
   onRestoreNetwork: () => void;
 }
@@ -14,6 +15,7 @@ export function FooterBar({
   unreadSeverity,
   unreadCount,
   restoringNetwork,
+  tunEnabled = false,
   onToggleLogs,
   onRestoreNetwork,
 }: FooterBarProps) {
@@ -42,7 +44,11 @@ export function FooterBar({
         className="btn btn--panic"
         onClick={onRestoreNetwork}
         disabled={restoringNetwork}
-        title="Idempotently restore OS system proxy settings"
+        title={
+          tunEnabled
+            ? "Idempotently restore OS routes, DNS, and system proxy settings"
+            : "Idempotently restore OS system proxy settings"
+        }
       >
         <RotateCcwIcon size={14} />
         <span>{restoringNetwork ? "Restoring..." : "Restore Network"}</span>

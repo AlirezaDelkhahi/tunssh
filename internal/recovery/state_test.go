@@ -965,3 +965,781 @@ func TestRestorerEdgeCases(t *testing.T) {
 		}
 	})
 }
+
+type mockTUNRecoveryOps struct {
+	mu           sync.Mutex
+	calls        []string
+	active       bool
+	activeErr    error
+	restoreErr   error
+	restoredSnap []TUNSnapshot
+}
+
+func (m *mockTUNRecoveryOps) IsTUNStateActive(ctx context.Context) (bool, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.calls = append(m.calls, "IsTUNStateActive")
+	if m.activeErr != nil {
+		return m.active, m.activeErr
+	}
+	return m.active, nil
+}
+
+func (m *mockTUNRecoveryOps) RestoreTUN(ctx context.Context, snap TUNSnapshot) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.calls = append(m.calls, "RestoreTUN")
+	m.restoredSnap = append(m.restoredSnap, snap)
+	return m.restoreErr
+}
+
+func (m *mockTUNRecoveryOps) Calls() []string {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	out := make([]string, len(m.calls))
+	copy(out, m.calls)
+	return out
+}
+
+func (m *mockTUNRecoveryOps) RestoredSnapshots() []TUNSnapshot {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	out := make([]TUNSnapshot, len(m.restoredSnap))
+	copy(out, m.restoredSnap)
+	return out
+}
+
+func (m *mockTUNRecoveryOps) SetRestoreErr(err error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.restoreErr = err
+}
+
+func sampleTUNSnapshot() TUNSnapshot {
+	return TUNSnapshot{
+		VPSPeerIP:      "203.0.113.10",
+		OrigGateway:    "192.168.1.1",
+		OrigIfaceName:  "wlan0",
+		OrigIfaceIndex: 3,
+		OrigDNSServers: []string{"192.168.1.1", "9.9.9.9"},
+		WinAdapterDNSBackups: []WinAdapterDNSBackup{
+			{
+				IfaceIndex: 3,
+				IfaceName:  "Wi-Fi",
+				IPv4DNS:    []string{"192.168.1.1"},
+				IPv6DNS:    []string{"fe80::1"},
+			},
+		},
+		LinuxDNSBackups: []LinuxDNSBackup{
+			{
+				IfIndex:      3,
+				IfName:       "wlan0",
+				DNSServers:   []string{"192.168.1.1"},
+				DefaultRoute: true,
+			},
+		},
+		DNSStrategy:      "systemd-resolved",
+		ResolvConfBackup: "nameserver 192.168.1.1\n",
+		TUNIfaceName:     "tunssh0",
+		InstalledRoutes:  []string{"203.0.113.10/32", "0.0.0.0/1", "128.0.0.0/1"},
+	}
+}
+
+func TestBeginTUNSessionAtomicPersistenceAndPerms(t *testing.T) {
+	configDir := filepath.Join(t.TempDir(), "tunssh-cfg")
+	store := mustNewStore(t, configDir)
+	fixedNow := time.Date(2026, 11, 24, 15, 30, 0, 0, time.UTC)
+
+	restorer := NewRestorer(
+		store,
+		nil,
+		WithPIDFunc(func() int { return 7788 }),
+		WithNowFunc(func() time.Time { return fixedNow }),
+	)
+
+	snap := sampleTUNSnapshot()
+	expectedSnap := sampleTUNSnapshot()
+	if err := restorer.BeginTUNSession(context.Background(), snap); err != nil {
+		t.Fatalf("BeginTUNSession() error: %v", err)
+	}
+
+	// Mutate caller slices after BeginTUNSession to ensure a defensive copy was persisted.
+	snap.OrigDNSServers[0] = "mutated"
+	snap.WinAdapterDNSBackups[0].IPv4DNS[0] = "mutated"
+	snap.LinuxDNSBackups[0].DNSServers[0] = "mutated"
+	snap.InstalledRoutes[0] = "mutated"
+
+	statePath := filepath.Join(configDir, StateFileName)
+	if runtime.GOOS != "windows" {
+		dirInfo, err := os.Stat(configDir)
+		if err != nil {
+			t.Fatalf("Stat(%q): %v", configDir, err)
+		}
+		if got := dirInfo.Mode().Perm(); got != 0o700 {
+			t.Fatalf("configDir perm = %04o, want 0700", got)
+		}
+
+		fileInfo, err := os.Stat(statePath)
+		if err != nil {
+			t.Fatalf("Stat(%q): %v", statePath, err)
+		}
+		if got := fileInfo.Mode().Perm(); got != 0o600 {
+			t.Fatalf("state file perm = %04o, want 0600", got)
+		}
+	}
+	assertZeroTempFiles(t, configDir)
+
+	got, err := store.Load()
+	if err != nil {
+		t.Fatalf("Load() after BeginTUNSession error: %v", err)
+	}
+	if got == nil {
+		t.Fatal("Load() after BeginTUNSession returned nil")
+	}
+	if got.SchemaVersion != SchemaVersion {
+		t.Errorf("SchemaVersion = %d, want %d", got.SchemaVersion, SchemaVersion)
+	}
+	if !got.Dirty {
+		t.Error("Dirty = false, want true")
+	}
+	if got.Mode != RecoveryModeTUN {
+		t.Errorf("Mode = %q, want %q", got.Mode, RecoveryModeTUN)
+	}
+	if got.PID != 7788 {
+		t.Errorf("PID = %d, want 7788", got.PID)
+	}
+	if !got.UpdatedAtUTC.Equal(fixedNow) {
+		t.Errorf("UpdatedAtUTC = %v, want %v", got.UpdatedAtUTC, fixedNow)
+	}
+	if got.ProxySnapshot != nil {
+		t.Errorf("ProxySnapshot = %+v, want nil", got.ProxySnapshot)
+	}
+	if !reflect.DeepEqual(got.TUNSnapshot, &expectedSnap) {
+		t.Errorf("TUNSnapshot = %+v, want %+v", got.TUNSnapshot, &expectedSnap)
+	}
+}
+
+func TestBeginTUNSessionValidationAndErrors(t *testing.T) {
+	t.Run("rejects nil store", func(t *testing.T) {
+		restorer := NewRestorer(nil, nil)
+		if err := restorer.BeginTUNSession(context.Background(), sampleTUNSnapshot()); err == nil {
+			t.Fatal("BeginTUNSession() with nil store succeeded, want error")
+		}
+	})
+
+	t.Run("propagates SaveDirty error", func(t *testing.T) {
+		saveErr := errors.New("disk full")
+		store := &failingRecoveryStore{saveDirtyErr: saveErr}
+		restorer := NewRestorer(store, nil)
+
+		err := restorer.BeginTUNSession(context.Background(), sampleTUNSnapshot())
+		if !errors.Is(err, saveErr) {
+			t.Fatalf("BeginTUNSession() error = %v, want wrapped %v", err, saveErr)
+		}
+	})
+
+	t.Run("respects canceled context", func(t *testing.T) {
+		store := &failingRecoveryStore{}
+		restorer := NewRestorer(store, nil)
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel()
+
+		err := restorer.BeginTUNSession(ctx, sampleTUNSnapshot())
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("BeginTUNSession() error = %v, want context.Canceled", err)
+		}
+		if len(store.calls) != 0 {
+			t.Fatalf("store calls = %v, want none on canceled context", store.calls)
+		}
+	})
+}
+
+func TestCheckAndRecoverOnStartupTUNMode(t *testing.T) {
+	t.Run("IsTUNStateActive false marks clean and reports recovered", func(t *testing.T) {
+		configDir := t.TempDir()
+		store := mustNewStore(t, configDir)
+		snap := sampleTUNSnapshot()
+		if err := store.SaveDirty(RecoveryState{
+			Mode:        RecoveryModeTUN,
+			PID:         999999,
+			TUNSnapshot: &snap,
+		}); err != nil {
+			t.Fatalf("SaveDirty() error: %v", err)
+		}
+
+		sysProxy := &mockSysProxyManager{}
+		tunOps := &mockTUNRecoveryOps{active: false}
+		restorer := NewRestorer(
+			store,
+			sysProxy,
+			WithPIDFunc(func() int { return 12345 }),
+			WithTUNRecoveryOps(tunOps),
+		)
+
+		res, err := restorer.CheckAndRecoverOnStartup(context.Background())
+		if err != nil {
+			t.Fatalf("CheckAndRecoverOnStartup() error: %v", err)
+		}
+		if !res.Recovered {
+			t.Error("Recovered = false, want true")
+		}
+		if res.Mode != RecoveryModeTUN {
+			t.Errorf("Mode = %q, want %q", res.Mode, RecoveryModeTUN)
+		}
+		if res.NeedsElevation {
+			t.Error("NeedsElevation = true, want false")
+		}
+		const wantMsg = "Previous TUN session ended unexpectedly; OS network routes were already cleanly restored."
+		if res.Message != wantMsg {
+			t.Errorf("Message = %q, want %q", res.Message, wantMsg)
+		}
+		if got := tunOps.Calls(); !reflect.DeepEqual(got, []string{"IsTUNStateActive"}) {
+			t.Fatalf("tunOps calls = %v, want [IsTUNStateActive]", got)
+		}
+		if got := sysProxy.Calls(); len(got) != 0 {
+			t.Fatalf("sysProxy calls = %v, want none", got)
+		}
+
+		after, err := store.Load()
+		if err != nil {
+			t.Fatalf("Load() error: %v", err)
+		}
+		if after == nil || after.Dirty {
+			t.Fatalf("state after clean TUN startup check = %+v, want dirty=false", after)
+		}
+		assertZeroTempFiles(t, configDir)
+	})
+
+	t.Run("IsTUNStateActive false returns error if MarkClean fails", func(t *testing.T) {
+		configDir := t.TempDir()
+		inner := mustNewStore(t, configDir)
+		snap := sampleTUNSnapshot()
+		if err := inner.SaveDirty(RecoveryState{
+			Mode:        RecoveryModeTUN,
+			PID:         999999,
+			TUNSnapshot: &snap,
+		}); err != nil {
+			t.Fatalf("SaveDirty() error: %v", err)
+		}
+
+		markErr := errors.New("read-only filesystem")
+		store := &failingRecoveryStore{inner: inner, markCleanErr: markErr}
+		tunOps := &mockTUNRecoveryOps{active: false}
+		restorer := NewRestorer(
+			store,
+			nil,
+			WithPIDFunc(func() int { return 12345 }),
+			WithTUNRecoveryOps(tunOps),
+		)
+
+		_, err := restorer.CheckAndRecoverOnStartup(context.Background())
+		if !errors.Is(err, markErr) {
+			t.Fatalf("CheckAndRecoverOnStartup() error = %v, want wrapped %v", err, markErr)
+		}
+		after, loadErr := inner.Load()
+		if loadErr != nil || after == nil || !after.Dirty {
+			t.Fatalf("state = (%+v, %v), want dirty=true preserved on MarkClean error", after, loadErr)
+		}
+	})
+
+	t.Run("IsTUNStateActive true leaves dirty and requires elevation", func(t *testing.T) {
+		configDir := t.TempDir()
+		store := mustNewStore(t, configDir)
+		snap := sampleTUNSnapshot()
+		if err := store.SaveDirty(RecoveryState{
+			Mode:        RecoveryModeTUN,
+			PID:         999999,
+			TUNSnapshot: &snap,
+		}); err != nil {
+			t.Fatalf("SaveDirty() error: %v", err)
+		}
+
+		tunOps := &mockTUNRecoveryOps{active: true}
+		restorer := NewRestorer(
+			store,
+			nil,
+			WithPIDFunc(func() int { return 12345 }),
+			WithTUNRecoveryOps(tunOps),
+		)
+
+		res, err := restorer.CheckAndRecoverOnStartup(context.Background())
+		if err != nil {
+			t.Fatalf("CheckAndRecoverOnStartup() error: %v", err)
+		}
+		if res.Recovered {
+			t.Error("Recovered = true, want false")
+		}
+		if res.Mode != RecoveryModeTUN {
+			t.Errorf("Mode = %q, want %q", res.Mode, RecoveryModeTUN)
+		}
+		if !res.NeedsElevation {
+			t.Error("NeedsElevation = false, want true")
+		}
+		const wantMsg = "Previous TUN session ended unexpectedly. Click Restore Network to clean up remaining TUN routes and DNS."
+		if res.Message != wantMsg {
+			t.Errorf("Message = %q, want %q", res.Message, wantMsg)
+		}
+		if got := tunOps.Calls(); !reflect.DeepEqual(got, []string{"IsTUNStateActive"}) {
+			t.Fatalf("tunOps calls = %v, want [IsTUNStateActive]", got)
+		}
+
+		after, err := store.Load()
+		if err != nil {
+			t.Fatalf("Load() error: %v", err)
+		}
+		if after == nil || !after.Dirty {
+			t.Fatalf("state = %+v, want dirty=true preserved", after)
+		}
+		if !reflect.DeepEqual(after.TUNSnapshot, &snap) {
+			t.Fatalf("TUNSnapshot = %+v, want %+v", after.TUNSnapshot, &snap)
+		}
+	})
+
+	t.Run("IsTUNStateActive error leaves dirty and requires elevation", func(t *testing.T) {
+		configDir := t.TempDir()
+		store := mustNewStore(t, configDir)
+		snap := sampleTUNSnapshot()
+		if err := store.SaveDirty(RecoveryState{
+			Mode:        RecoveryModeTUN,
+			PID:         999999,
+			TUNSnapshot: &snap,
+		}); err != nil {
+			t.Fatalf("SaveDirty() error: %v", err)
+		}
+
+		tunOps := &mockTUNRecoveryOps{
+			active:    false,
+			activeErr: errors.New("netlink probe failed"),
+		}
+		restorer := NewRestorer(
+			store,
+			nil,
+			WithPIDFunc(func() int { return 12345 }),
+			WithTUNRecoveryOps(tunOps),
+		)
+
+		res, err := restorer.CheckAndRecoverOnStartup(context.Background())
+		if err != nil {
+			t.Fatalf("CheckAndRecoverOnStartup() error: %v, want nil with NeedsElevation=true", err)
+		}
+		if res.Recovered {
+			t.Error("Recovered = true, want false")
+		}
+		if res.Mode != RecoveryModeTUN {
+			t.Errorf("Mode = %q, want %q", res.Mode, RecoveryModeTUN)
+		}
+		if !res.NeedsElevation {
+			t.Error("NeedsElevation = false, want true")
+		}
+		const wantMsg = "Previous TUN session ended unexpectedly. Click Restore Network to clean up remaining TUN routes and DNS."
+		if res.Message != wantMsg {
+			t.Errorf("Message = %q, want %q", res.Message, wantMsg)
+		}
+
+		after, err := store.Load()
+		if err != nil {
+			t.Fatalf("Load() error: %v", err)
+		}
+		if after == nil || !after.Dirty {
+			t.Fatalf("state = %+v, want dirty=true preserved", after)
+		}
+	})
+
+	t.Run("same PID skips IsTUNStateActive and preserves dirty state", func(t *testing.T) {
+		configDir := t.TempDir()
+		store := mustNewStore(t, configDir)
+		snap := sampleTUNSnapshot()
+		const livePID = 65432
+		if err := store.SaveDirty(RecoveryState{
+			Mode:        RecoveryModeTUN,
+			PID:         livePID,
+			TUNSnapshot: &snap,
+		}); err != nil {
+			t.Fatalf("SaveDirty() error: %v", err)
+		}
+
+		tunOps := &mockTUNRecoveryOps{active: false}
+		restorer := NewRestorer(
+			store,
+			nil,
+			WithPIDFunc(func() int { return livePID }),
+			WithTUNRecoveryOps(tunOps),
+		)
+
+		res, err := restorer.CheckAndRecoverOnStartup(context.Background())
+		if err != nil {
+			t.Fatalf("CheckAndRecoverOnStartup() error: %v", err)
+		}
+		if res != (StartupRecoveryResult{}) {
+			t.Fatalf("result = %+v, want zero StartupRecoveryResult", res)
+		}
+		if got := tunOps.Calls(); len(got) != 0 {
+			t.Fatalf("tunOps calls = %v, want none for same PID", got)
+		}
+		after, err := store.Load()
+		if err != nil || after == nil || !after.Dirty {
+			t.Fatalf("state = (%+v, %v), want dirty=true preserved", after, err)
+		}
+	})
+}
+
+func TestRestoreTUNSessionAndRestoreNetworkWithMockTUNOps(t *testing.T) {
+	t.Run("RestoreTUNSession invokes RestoreTUN with exact snapshot idempotently", func(t *testing.T) {
+		configDir := t.TempDir()
+		store := mustNewStore(t, configDir)
+		snap := sampleTUNSnapshot()
+		if err := store.SaveDirty(RecoveryState{
+			Mode:        RecoveryModeTUN,
+			PID:         77777,
+			TUNSnapshot: &snap,
+		}); err != nil {
+			t.Fatalf("SaveDirty() error: %v", err)
+		}
+
+		sysProxy := &mockSysProxyManager{}
+		tunOps := &mockTUNRecoveryOps{}
+		restorer := NewRestorer(store, sysProxy, WithTUNRecoveryOps(tunOps))
+
+		if err := restorer.RestoreTUNSession(context.Background()); err != nil {
+			t.Fatalf("first RestoreTUNSession() error: %v", err)
+		}
+		if err := restorer.RestoreTUNSession(context.Background()); err != nil {
+			t.Fatalf("second RestoreTUNSession() error: %v", err)
+		}
+
+		if got := tunOps.Calls(); !reflect.DeepEqual(got, []string{"RestoreTUN"}) {
+			t.Fatalf("tunOps calls = %v, want single [RestoreTUN] across two calls", got)
+		}
+		restored := tunOps.RestoredSnapshots()
+		if len(restored) != 1 || !reflect.DeepEqual(restored[0], snap) {
+			t.Fatalf("restored snapshots = %+v, want [%+v]", restored, snap)
+		}
+		if got := sysProxy.Calls(); len(got) != 0 {
+			t.Fatalf("sysProxy calls = %v, want none", got)
+		}
+
+		after, err := store.Load()
+		if err != nil {
+			t.Fatalf("Load() error: %v", err)
+		}
+		if after == nil || after.Dirty {
+			t.Fatalf("state = %+v, want dirty=false", after)
+		}
+		assertZeroTempFiles(t, configDir)
+	})
+
+	t.Run("RestoreNetwork restores dirty TUN session with exact snapshot idempotently", func(t *testing.T) {
+		configDir := t.TempDir()
+		store := mustNewStore(t, configDir)
+		snap := sampleTUNSnapshot()
+		if err := store.SaveDirty(RecoveryState{
+			Mode:        RecoveryModeTUN,
+			PID:         77777,
+			TUNSnapshot: &snap,
+		}); err != nil {
+			t.Fatalf("SaveDirty() error: %v", err)
+		}
+
+		sysProxy := &mockSysProxyManager{}
+		tunOps := &mockTUNRecoveryOps{}
+		restorer := NewRestorer(store, sysProxy, WithTUNRecoveryOps(tunOps))
+
+		if err := restorer.RestoreNetwork(context.Background()); err != nil {
+			t.Fatalf("first RestoreNetwork() error: %v", err)
+		}
+		if err := restorer.RestoreNetwork(context.Background()); err != nil {
+			t.Fatalf("second RestoreNetwork() error: %v", err)
+		}
+
+		if got := tunOps.Calls(); !reflect.DeepEqual(got, []string{"RestoreTUN"}) {
+			t.Fatalf("tunOps calls = %v, want single [RestoreTUN] across two calls", got)
+		}
+		restored := tunOps.RestoredSnapshots()
+		if len(restored) != 1 || !reflect.DeepEqual(restored[0], snap) {
+			t.Fatalf("restored snapshots = %+v, want [%+v]", restored, snap)
+		}
+		if got := sysProxy.Calls(); len(got) != 0 {
+			t.Fatalf("sysProxy calls = %v, want none", got)
+		}
+
+		after, err := store.Load()
+		if err != nil {
+			t.Fatalf("Load() error: %v", err)
+		}
+		if after == nil || after.Dirty {
+			t.Fatalf("state = %+v, want dirty=false", after)
+		}
+	})
+
+	t.Run("RestoreTUNSession preserves dirty state on failure and recovers on retry", func(t *testing.T) {
+		configDir := t.TempDir()
+		store := mustNewStore(t, configDir)
+		snap := sampleTUNSnapshot()
+		if err := store.SaveDirty(RecoveryState{
+			Mode:        RecoveryModeTUN,
+			PID:         77777,
+			TUNSnapshot: &snap,
+		}); err != nil {
+			t.Fatalf("SaveDirty() error: %v", err)
+		}
+
+		restoreErr := errors.New("helper elevation canceled")
+		tunOps := &mockTUNRecoveryOps{restoreErr: restoreErr}
+		restorer := NewRestorer(store, nil, WithTUNRecoveryOps(tunOps))
+
+		err := restorer.RestoreTUNSession(context.Background())
+		if !errors.Is(err, restoreErr) {
+			t.Fatalf("RestoreTUNSession() error = %v, want wrapped %v", err, restoreErr)
+		}
+
+		afterFail, err := store.Load()
+		if err != nil {
+			t.Fatalf("Load() after failure error: %v", err)
+		}
+		if afterFail == nil || !afterFail.Dirty {
+			t.Fatalf("state after failed restore = %+v, want dirty=true preserved", afterFail)
+		}
+		if !reflect.DeepEqual(afterFail.TUNSnapshot, &snap) {
+			t.Fatalf("TUNSnapshot after failed restore = %+v, want %+v", afterFail.TUNSnapshot, &snap)
+		}
+
+		tunOps.SetRestoreErr(nil)
+		if err := restorer.RestoreTUNSession(context.Background()); err != nil {
+			t.Fatalf("retry RestoreTUNSession() error: %v", err)
+		}
+		if got := tunOps.Calls(); !reflect.DeepEqual(got, []string{"RestoreTUN", "RestoreTUN"}) {
+			t.Fatalf("tunOps calls = %v, want two RestoreTUN calls", got)
+		}
+		afterRetry, err := store.Load()
+		if err != nil {
+			t.Fatalf("Load() after retry error: %v", err)
+		}
+		if afterRetry == nil || afterRetry.Dirty {
+			t.Fatalf("state after retry = %+v, want dirty=false", afterRetry)
+		}
+	})
+
+	t.Run("RestoreNetwork preserves dirty state when RestoreTUN fails", func(t *testing.T) {
+		configDir := t.TempDir()
+		store := mustNewStore(t, configDir)
+		snap := sampleTUNSnapshot()
+		if err := store.SaveDirty(RecoveryState{
+			Mode:        RecoveryModeTUN,
+			PID:         77777,
+			TUNSnapshot: &snap,
+		}); err != nil {
+			t.Fatalf("SaveDirty() error: %v", err)
+		}
+
+		restoreErr := errors.New("pkexec dismissed")
+		tunOps := &mockTUNRecoveryOps{restoreErr: restoreErr}
+		restorer := NewRestorer(store, nil, WithTUNRecoveryOps(tunOps))
+
+		err := restorer.RestoreNetwork(context.Background())
+		if !errors.Is(err, restoreErr) {
+			t.Fatalf("RestoreNetwork() error = %v, want wrapped %v", err, restoreErr)
+		}
+
+		after, loadErr := store.Load()
+		if loadErr != nil {
+			t.Fatalf("Load() error: %v", loadErr)
+		}
+		if after == nil || !after.Dirty {
+			t.Fatalf("state = %+v, want dirty=true preserved", after)
+		}
+	})
+
+	t.Run("RestoreTUNSession on missing or clean state marks clean without calling RestoreTUN", func(t *testing.T) {
+		configDir := t.TempDir()
+		store := mustNewStore(t, configDir)
+		tunOps := &mockTUNRecoveryOps{}
+		sysProxy := &mockSysProxyManager{}
+		restorer := NewRestorer(store, sysProxy, WithTUNRecoveryOps(tunOps))
+
+		if err := restorer.RestoreTUNSession(context.Background()); err != nil {
+			t.Fatalf("RestoreTUNSession() on missing state error: %v", err)
+		}
+		if err := restorer.RestoreTUNSession(context.Background()); err != nil {
+			t.Fatalf("RestoreTUNSession() on clean state error: %v", err)
+		}
+		if got := tunOps.Calls(); len(got) != 0 {
+			t.Fatalf("tunOps calls = %v, want none", got)
+		}
+		if got := sysProxy.Calls(); len(got) != 0 {
+			t.Fatalf("sysProxy calls = %v, want none", got)
+		}
+		state, err := store.Load()
+		if err != nil || state == nil || state.Dirty {
+			t.Fatalf("state = (%+v, %v), want clean state persisted", state, err)
+		}
+	})
+
+	t.Run("RestoreTUNSession delegates proxy mode to proxy restore", func(t *testing.T) {
+		configDir := t.TempDir()
+		store := mustNewStore(t, configDir)
+		snap := sampleProxySnapshot()
+		if err := store.SaveDirty(RecoveryState{
+			Mode:          RecoveryModeProxy,
+			PID:           88888,
+			ProxySnapshot: &snap,
+		}); err != nil {
+			t.Fatalf("SaveDirty() error: %v", err)
+		}
+
+		sysProxy := &mockSysProxyManager{}
+		tunOps := &mockTUNRecoveryOps{}
+		restorer := NewRestorer(store, sysProxy, WithTUNRecoveryOps(tunOps))
+
+		if err := restorer.RestoreTUNSession(context.Background()); err != nil {
+			t.Fatalf("RestoreTUNSession() error: %v", err)
+		}
+		if got := sysProxy.Calls(); !reflect.DeepEqual(got, []string{"Restore"}) {
+			t.Fatalf("sysProxy calls = %v, want [Restore]", got)
+		}
+		if got := tunOps.Calls(); len(got) != 0 {
+			t.Fatalf("tunOps calls = %v, want none", got)
+		}
+		after, err := store.Load()
+		if err != nil || after == nil || after.Dirty {
+			t.Fatalf("state = (%+v, %v), want dirty=false", after, err)
+		}
+	})
+
+	t.Run("RestoreTUNSession with nil TUNSnapshot passes empty snapshot", func(t *testing.T) {
+		configDir := t.TempDir()
+		store := mustNewStore(t, configDir)
+		if err := store.SaveDirty(RecoveryState{
+			Mode: RecoveryModeTUN,
+			PID:  88888,
+		}); err != nil {
+			t.Fatalf("SaveDirty() error: %v", err)
+		}
+
+		tunOps := &mockTUNRecoveryOps{}
+		restorer := NewRestorer(store, nil, WithTUNRecoveryOps(tunOps))
+
+		if err := restorer.RestoreTUNSession(context.Background()); err != nil {
+			t.Fatalf("RestoreTUNSession() error: %v", err)
+		}
+		restored := tunOps.RestoredSnapshots()
+		if len(restored) != 1 || !reflect.DeepEqual(restored[0], TUNSnapshot{}) {
+			t.Fatalf("restored snapshots = %+v, want [empty TUNSnapshot]", restored)
+		}
+		after, err := store.Load()
+		if err != nil || after == nil || after.Dirty {
+			t.Fatalf("state = (%+v, %v), want dirty=false", after, err)
+		}
+	})
+
+	t.Run("RestoreTUNSession returns ErrTUNRestoreNotSupported when tunOps is nil", func(t *testing.T) {
+		configDir := t.TempDir()
+		store := mustNewStore(t, configDir)
+		snap := sampleTUNSnapshot()
+		if err := store.SaveDirty(RecoveryState{
+			Mode:        RecoveryModeTUN,
+			PID:         88888,
+			TUNSnapshot: &snap,
+		}); err != nil {
+			t.Fatalf("SaveDirty() error: %v", err)
+		}
+
+		restorer := NewRestorer(store, nil, WithTUNRecoveryOps(nil))
+		err := restorer.RestoreTUNSession(context.Background())
+		if !errors.Is(err, ErrTUNRestoreNotSupported) {
+			t.Fatalf("RestoreTUNSession() error = %v, want ErrTUNRestoreNotSupported", err)
+		}
+		after, loadErr := store.Load()
+		if loadErr != nil || after == nil || !after.Dirty {
+			t.Fatalf("state = (%+v, %v), want dirty=true preserved", after, loadErr)
+		}
+	})
+
+	t.Run("RestoreTUNSession rejects unknown dirty mode without clearing state", func(t *testing.T) {
+		configDir := t.TempDir()
+		store := mustNewStore(t, configDir)
+		if err := store.SaveDirty(RecoveryState{
+			Mode: "bogus",
+			PID:  88888,
+		}); err != nil {
+			t.Fatalf("SaveDirty() error: %v", err)
+		}
+
+		tunOps := &mockTUNRecoveryOps{}
+		restorer := NewRestorer(store, nil, WithTUNRecoveryOps(tunOps))
+		err := restorer.RestoreTUNSession(context.Background())
+		if !errors.Is(err, ErrUnsupportedMode) {
+			t.Fatalf("RestoreTUNSession() error = %v, want ErrUnsupportedMode", err)
+		}
+		after, loadErr := store.Load()
+		if loadErr != nil || after == nil || !after.Dirty {
+			t.Fatalf("state = (%+v, %v), want dirty=true preserved", after, loadErr)
+		}
+	})
+}
+
+func TestCompleteTUNSession(t *testing.T) {
+	t.Run("marks dirty TUN state clean without calling tunOps.RestoreTUN", func(t *testing.T) {
+		configDir := t.TempDir()
+		store := mustNewStore(t, configDir)
+		snap := sampleTUNSnapshot()
+		if err := store.SaveDirty(RecoveryState{
+			Mode:        RecoveryModeTUN,
+			PID:         88888,
+			TUNSnapshot: &snap,
+		}); err != nil {
+			t.Fatalf("SaveDirty() error: %v", err)
+		}
+
+		sysProxy := &mockSysProxyManager{}
+		tunOps := &mockTUNRecoveryOps{}
+		restorer := NewRestorer(store, sysProxy, WithTUNRecoveryOps(tunOps))
+
+		if err := restorer.CompleteTUNSession(context.Background()); err != nil {
+			t.Fatalf("CompleteTUNSession() error: %v", err)
+		}
+		if err := restorer.CompleteTUNSession(context.Background()); err != nil {
+			t.Fatalf("second CompleteTUNSession() error: %v", err)
+		}
+		if got := tunOps.Calls(); len(got) != 0 {
+			t.Fatalf("tunOps calls = %v, want none", got)
+		}
+		if got := sysProxy.Calls(); len(got) != 0 {
+			t.Fatalf("sysProxy calls = %v, want none", got)
+		}
+		after, err := store.Load()
+		if err != nil || after == nil || after.Dirty {
+			t.Fatalf("state = (%+v, %v), want dirty=false", after, err)
+		}
+	})
+
+	t.Run("delegates dirty proxy state to sysProxy.Restore", func(t *testing.T) {
+		configDir := t.TempDir()
+		store := mustNewStore(t, configDir)
+		snap := sampleProxySnapshot()
+		if err := store.SaveDirty(RecoveryState{
+			Mode:          RecoveryModeProxy,
+			PID:           88888,
+			ProxySnapshot: &snap,
+		}); err != nil {
+			t.Fatalf("SaveDirty() error: %v", err)
+		}
+
+		sysProxy := &mockSysProxyManager{}
+		tunOps := &mockTUNRecoveryOps{}
+		restorer := NewRestorer(store, sysProxy, WithTUNRecoveryOps(tunOps))
+
+		if err := restorer.CompleteTUNSession(context.Background()); err != nil {
+			t.Fatalf("CompleteTUNSession() error: %v", err)
+		}
+		if got := sysProxy.Calls(); !reflect.DeepEqual(got, []string{"Restore"}) {
+			t.Fatalf("sysProxy calls = %v, want [Restore]", got)
+		}
+		if got := tunOps.Calls(); len(got) != 0 {
+			t.Fatalf("tunOps calls = %v, want none", got)
+		}
+		after, err := store.Load()
+		if err != nil || after == nil || after.Dirty {
+			t.Fatalf("state = (%+v, %v), want dirty=false", after, err)
+		}
+	})
+}

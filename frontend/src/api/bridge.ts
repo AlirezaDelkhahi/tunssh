@@ -96,6 +96,16 @@ export interface ProxyCapabilitiesDTO {
   desktop_env: string;
 }
 
+export interface TUNCapsDTO {
+  supported: boolean;
+  requires_elevation: boolean;
+  has_persistent_cap: boolean;
+  can_enable_persistent_cap: boolean;
+  iface_name: string;
+  tun_ipv4: string;
+  tun_dns: string;
+}
+
 export interface ShareInspectDTO {
   version: number;
   mode: "enc" | "plain";
@@ -106,6 +116,7 @@ export interface BootstrapStateDTO {
   vault_backend: "keyring" | "encrypted-file";
   vault_locked: boolean;
   proxy_caps: ProxyCapabilitiesDTO;
+  tun_caps: TUNCapsDTO;
   status: TunnelStatusDTO;
   profiles: ProfileView[];
   recovery?: StartupRecoveryDTO | null;
@@ -130,6 +141,7 @@ export interface AppServiceBindings {
   Disconnect(): Promise<void>;
   RestoreNetwork(): Promise<void>;
   SetBypassIranLAN(profileID: string, bypass: boolean): Promise<ProfileView>;
+  EnablePersistentTUNAccess(): Promise<string>;
   ExportShareLink(
     profileID: string,
     passphrase: string,
@@ -258,6 +270,16 @@ function createPreviewAppService(): AppServiceBindings {
     last_error: null,
   };
 
+  let tunCaps: TUNCapsDTO = {
+    supported: true,
+    requires_elevation: true,
+    has_persistent_cap: false,
+    can_enable_persistent_cap: true,
+    iface_name: "tunssh0",
+    tun_ipv4: "198.18.0.1",
+    tun_dns: "198.18.0.2",
+  };
+
   let logs: LogEntryDTO[] = [
     {
       timestamp: nowIso(),
@@ -298,11 +320,12 @@ function createPreviewAppService(): AppServiceBindings {
           auto_supported: true,
           desktop_env: "preview",
         },
+        tun_caps: { ...tunCaps },
         status: { ...status },
         profiles: profiles.map((p) => ({ ...p })),
         recovery: null,
-        milestone: 1,
-        tun_enabled: false,
+        milestone: 2,
+        tun_enabled: true,
       };
     },
     async UnlockVault(_passphrase: string): Promise<void> {
@@ -395,21 +418,28 @@ function createPreviewAppService(): AppServiceBindings {
       if (!prof) {
         throw new Error("Profile not found");
       }
-      if (mode === "tun") {
-        throw new Error("Full TUN mode is disabled in Milestone 1.");
+      const normalizedMode = mode.trim().toLowerCase();
+      if (
+        normalizedMode !== "" &&
+        normalizedMode !== "proxy" &&
+        normalizedMode !== "tun"
+      ) {
+        throw new Error(`Unsupported tunnel mode "${mode}".`);
       }
+      const targetMode: "proxy" | "tun" =
+        normalizedMode === "tun" ? "tun" : "proxy";
       stopTimer();
       setStatus({
         ...status,
         state: "connecting",
         profile_id: prof.id,
-        mode: "proxy",
+        mode: targetMode,
         attempt: 1,
         last_error: null,
       });
       pushLog({
         level: "INFO",
-        message: `Connecting to ${prof.host}:${prof.port} via SSH (preview)...`,
+        message: `Connecting to ${prof.host}:${prof.port} via SSH (${targetMode === "tun" ? "Full TUN + DNS" : "System Proxy"}, preview)...`,
       });
 
       window.setTimeout(() => {
@@ -434,7 +464,7 @@ function createPreviewAppService(): AppServiceBindings {
           ...status,
           state: "connected",
           profile_id: prof.id,
-          mode: "proxy",
+          mode: targetMode,
           attempt: 0,
           rtt_ms: 48,
           connected_at_unix: connectedAt,
@@ -442,7 +472,10 @@ function createPreviewAppService(): AppServiceBindings {
         });
         pushLog({
           level: "INFO",
-          message: `Connected to ${prof.host}:${prof.port} (SOCKS5 :10808, HTTP :10809).`,
+          message:
+            targetMode === "tun"
+              ? `Connected to ${prof.host}:${prof.port} via Full TUN (${tunCaps.iface_name} • ${tunCaps.tun_ipv4}/15, DNS ${tunCaps.tun_dns}:53).`
+              : `Connected to ${prof.host}:${prof.port} (SOCKS5 :10808, HTTP :10809).`,
         });
         statsTimer = window.setInterval(() => {
           const rxRate = Math.floor(24000 + Math.random() * 140000);
@@ -464,6 +497,11 @@ function createPreviewAppService(): AppServiceBindings {
       algorithm: string,
       sha256: string,
     ): Promise<void> {
+      const targetProf = profiles.find((p) => p.id === profileID);
+      const nextMode =
+        status.mode === "tun" || targetProf?.preferred_mode === "tun"
+          ? "tun"
+          : "proxy";
       profiles = profiles.map((p) =>
         p.id === profileID
           ? {
@@ -477,7 +515,7 @@ function createPreviewAppService(): AppServiceBindings {
         level: "INFO",
         message: `Trusted ${algorithm} host key ${sha256}.`,
       });
-      await this.Connect(profileID, "proxy");
+      await this.Connect(profileID, nextMode);
     },
     async ForgetHostKey(profileID: string): Promise<ProfileView> {
       return this.ClearHostKey(profileID);
@@ -508,7 +546,7 @@ function createPreviewAppService(): AppServiceBindings {
       });
       pushLog({
         level: "INFO",
-        message: "OS system proxy settings verified and restored.",
+        message: "OS routes, DNS, and system proxy settings verified and restored.",
       });
     },
     async SetBypassIranLAN(
@@ -530,6 +568,19 @@ function createPreviewAppService(): AppServiceBindings {
         message: `Bypass Iran (.ir) & LAN ${bypass ? "enabled" : "disabled"} for "${updated.name}".`,
       });
       return { ...updated };
+    },
+    async EnablePersistentTUNAccess(): Promise<string> {
+      tunCaps = {
+        ...tunCaps,
+        has_persistent_cap: true,
+      };
+      const message =
+        "Persistent TUN capabilities enabled (preview). Future launches can run Full TUN without pkexec.";
+      pushLog({
+        level: "INFO",
+        message,
+      });
+      return message;
     },
     async ExportShareLink(
       profileID: string,
@@ -683,6 +734,8 @@ export const api: AppServiceBindings = {
   RestoreNetwork: () => getAppService().RestoreNetwork(),
   SetBypassIranLAN: (profileID, bypass) =>
     getAppService().SetBypassIranLAN(profileID, bypass),
+  EnablePersistentTUNAccess: () =>
+    getAppService().EnablePersistentTUNAccess(),
   ExportShareLink: (profileID, passphrase, unsafePlain) =>
     getAppService().ExportShareLink(profileID, passphrase, unsafePlain),
   InspectShareLink: (link) => getAppService().InspectShareLink(link),

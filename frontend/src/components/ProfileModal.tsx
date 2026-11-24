@@ -15,6 +15,7 @@ import {
 interface ProfileModalProps {
   open: boolean;
   profile: ProfileView | null;
+  tunEnabled?: boolean;
   onClose: () => void;
   onSave: (req: SaveProfileRequest) => Promise<void>;
   onDelete: (profileID: string) => Promise<void>;
@@ -31,6 +32,7 @@ const PORT_PRESETS = [
 export function ProfileModal({
   open,
   profile,
+  tunEnabled = false,
   onClose,
   onSave,
   onDelete,
@@ -50,6 +52,7 @@ export function ProfileModal({
   const [keyPassphrase, setKeyPassphrase] = useState("");
   const [showKeyPassphrase, setShowKeyPassphrase] = useState(false);
   const [bypassIranLAN, setBypassIranLAN] = useState(true);
+  const [preferredMode, setPreferredMode] = useState<"proxy" | "tun">("proxy");
 
   const [saving, setSaving] = useState(false);
   const [clearingKey, setClearingKey] = useState(false);
@@ -80,6 +83,7 @@ export function ProfileModal({
       setUsername(profile.username);
       setAuthType(profile.auth_type);
       setBypassIranLAN(profile.bypass_iran_lan);
+      setPreferredMode(profile.preferred_mode === "tun" ? "tun" : "proxy");
     } else {
       setName("");
       setHost("");
@@ -87,6 +91,7 @@ export function ProfileModal({
       setUsername("");
       setAuthType("password");
       setBypassIranLAN(true);
+      setPreferredMode("proxy");
     }
 
     const id = window.setTimeout(() => nameRef.current?.focus(), 20);
@@ -224,7 +229,7 @@ export function ProfileModal({
       username: trimmedUser,
       auth_type: authType,
       bypass_iran_lan: bypassIranLAN,
-      preferred_mode: profile?.preferred_mode ?? "proxy",
+      preferred_mode: preferredMode,
       password: authType === "password" && !keepExistingSecrets ? password : "",
       private_key:
         authType === "key" && !keepExistingSecrets ? privateKey.trim() : "",
@@ -496,6 +501,36 @@ export function ProfileModal({
                 </div>
               </div>
             </>
+          )}
+
+          {tunEnabled && (
+            <div className="field">
+              <span className="field__label">Default Tunnel Mode</span>
+              <div
+                className="segmented segmented--sm"
+                role="radiogroup"
+                aria-label="Default tunnel mode"
+              >
+                <button
+                  type="button"
+                  role="radio"
+                  aria-checked={preferredMode === "proxy"}
+                  className={`segmented__btn ${preferredMode === "proxy" ? "is-active" : ""}`}
+                  onClick={() => setPreferredMode("proxy")}
+                >
+                  System Proxy
+                </button>
+                <button
+                  type="button"
+                  role="radio"
+                  aria-checked={preferredMode === "tun"}
+                  className={`segmented__btn ${preferredMode === "tun" ? "is-active" : ""}`}
+                  onClick={() => setPreferredMode("tun")}
+                >
+                  Full TUN (All Apps)
+                </button>
+              </div>
+            </div>
           )}
 
           <label className="checkbox-row">

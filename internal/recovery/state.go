@@ -55,6 +55,7 @@ type LinuxDNSBackup struct {
 type TUNSnapshot struct {
 	VPSPeerIP            string                `json:"vps_peer_ip"`
 	OrigGateway          string                `json:"orig_gateway"`
+	OrigGateway6         string                `json:"orig_gateway6,omitempty"`
 	OrigIfaceName        string                `json:"orig_iface_name"`
 	OrigIfaceIndex       int                   `json:"orig_iface_index"`
 	OrigDNSServers       []string              `json:"orig_dns_servers,omitempty"`

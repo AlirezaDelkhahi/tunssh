@@ -12,12 +12,14 @@ import (
 	"sync/atomic"
 
 	"github.com/AlirezaDelkhahi/tunssh/internal/app"
+	"github.com/AlirezaDelkhahi/tunssh/internal/profile"
 	"github.com/AlirezaDelkhahi/tunssh/internal/sshclient"
 	"github.com/energye/systray"
 )
 
 type trayActions struct {
 	OnToggleConnect func()
+	OnSelectMode    func(mode string)
 	OnRestore       func()
 	OnShowWindow    func()
 	OnQuit          func()
@@ -33,26 +35,29 @@ type trayIconSet struct {
 type trayController struct {
 	actions trayActions
 	icons   trayIconSet
+	tunCaps app.TUNCapsDTO
 
-	mu        sync.Mutex
-	started   bool
-	ready     bool
-	endFn     func()
-	toggle    *systray.MenuItem
-	modeProxy *systray.MenuItem
-	modeTUN   *systray.MenuItem
-	restore   *systray.MenuItem
-	openWin   *systray.MenuItem
-	quitItem  *systray.MenuItem
-	status    app.TunnelStatusDTO
+	mu           sync.Mutex
+	started      bool
+	ready        bool
+	endFn        func()
+	toggle       *systray.MenuItem
+	modeProxy    *systray.MenuItem
+	modeTUN      *systray.MenuItem
+	restore      *systray.MenuItem
+	openWin      *systray.MenuItem
+	quitItem     *systray.MenuItem
+	status       app.TunnelStatusDTO
+	selectedMode string
 
 	stopOnce sync.Once
 	stopped  atomic.Bool
 }
 
-func newTrayController(actions trayActions) *trayController {
+func newTrayController(actions trayActions, tunCaps app.TUNCapsDTO) *trayController {
 	return &trayController{
 		actions: actions,
+		tunCaps: tunCaps,
 		icons: trayIconSet{
 			disconnected: buildTrayIcon(color.NRGBA{R: 0x64, G: 0x74, B: 0x8B, A: 0xFF}),
 			connecting:   buildTrayIcon(color.NRGBA{R: 0xF5, G: 0x9E, B: 0x0B, A: 0xFF}),
@@ -61,8 +66,9 @@ func newTrayController(actions trayActions) *trayController {
 		},
 		status: app.TunnelStatusDTO{
 			State: string(sshclient.StateDisconnected),
-			Mode:  "proxy",
+			Mode:  string(profile.ModeProxy),
 		},
+		selectedMode: string(profile.ModeProxy),
 	}
 }
 
@@ -105,14 +111,41 @@ func (t *trayController) Stop() {
 func (t *trayController) UpdateStatus(status app.TunnelStatusDTO) {
 	t.mu.Lock()
 	t.status = status
+	if status.Mode == string(profile.ModeProxy) || status.Mode == string(profile.ModeTUN) {
+		if isActiveTunnelState(status.State) {
+			t.selectedMode = status.Mode
+		}
+	}
 	ready := t.ready
 	toggle := t.toggle
+	modeProxy := t.modeProxy
+	modeTUN := t.modeTUN
+	selectedMode := t.selectedMode
 	t.mu.Unlock()
 
 	if !ready {
 		return
 	}
-	t.applyStatusUI(status, toggle)
+	t.applyStatusUI(status, selectedMode, toggle, modeProxy, modeTUN)
+}
+
+func (t *trayController) SetSelectedMode(mode string) {
+	if mode != string(profile.ModeTUN) || !t.tunCaps.Supported {
+		mode = string(profile.ModeProxy)
+	}
+	t.mu.Lock()
+	t.selectedMode = mode
+	ready := t.ready
+	status := t.status
+	toggle := t.toggle
+	modeProxy := t.modeProxy
+	modeTUN := t.modeTUN
+	t.mu.Unlock()
+
+	if !ready {
+		return
+	}
+	t.applyStatusUI(status, mode, toggle, modeProxy, modeTUN)
 }
 
 func (t *trayController) onReady() {
@@ -137,14 +170,46 @@ func (t *trayController) onReady() {
 	})
 
 	modeProxy := systray.AddMenuItemCheckbox("Mode: System Proxy", "Unprivileged local SOCKS5/HTTP proxy mode", true)
-	modeProxy.Disable()
+	modeProxy.Click(func() {
+		t.mu.Lock()
+		active := isActiveTunnelState(t.status.State)
+		t.mu.Unlock()
+		if active {
+			return
+		}
+		t.SetSelectedMode(string(profile.ModeProxy))
+		if t.actions.OnSelectMode != nil {
+			go t.actions.OnSelectMode(string(profile.ModeProxy))
+		}
+	})
 
-	modeTUN := systray.AddMenuItem("Full TUN (Milestone 2)", "Full device TUN routing arrives in Milestone 2")
-	modeTUN.Disable()
+	tunTitle := "Mode: Full TUN (All Apps)"
+	if !t.tunCaps.Supported {
+		tunTitle = "Mode: Full TUN (Unsupported)"
+	} else if t.tunCaps.RequiresElevation {
+		tunTitle = "Mode: Full TUN (Admin)"
+	}
+	modeTUN := systray.AddMenuItemCheckbox(tunTitle, "Route all device TCP traffic and DNS through SSH TUN", false)
+	if !t.tunCaps.Supported {
+		modeTUN.Disable()
+	} else {
+		modeTUN.Click(func() {
+			t.mu.Lock()
+			active := isActiveTunnelState(t.status.State)
+			t.mu.Unlock()
+			if active {
+				return
+			}
+			t.SetSelectedMode(string(profile.ModeTUN))
+			if t.actions.OnSelectMode != nil {
+				go t.actions.OnSelectMode(string(profile.ModeTUN))
+			}
+		})
+	}
 
 	systray.AddSeparator()
 
-	restore := systray.AddMenuItem("Restore Network", "Verify and restore OS proxy configuration")
+	restore := systray.AddMenuItem("Restore Network", "Verify and restore OS proxy, split routes, and DNS configuration")
 	restore.Click(func() {
 		if t.actions.OnRestore != nil {
 			go t.actions.OnRestore()
@@ -176,9 +241,10 @@ func (t *trayController) onReady() {
 	t.quitItem = quitItem
 	t.ready = true
 	status := t.status
+	selectedMode := t.selectedMode
 	t.mu.Unlock()
 
-	t.applyStatusUI(status, toggle)
+	t.applyStatusUI(status, selectedMode, toggle, modeProxy, modeTUN)
 }
 
 func (t *trayController) onExit() {
@@ -187,7 +253,7 @@ func (t *trayController) onExit() {
 	t.mu.Unlock()
 }
 
-func (t *trayController) applyStatusUI(status app.TunnelStatusDTO, toggle *systray.MenuItem) {
+func (t *trayController) applyStatusUI(status app.TunnelStatusDTO, selectedMode string, toggle, modeProxy, modeTUN *systray.MenuItem) {
 	icon := t.icons.disconnected
 	tooltip := "tunssh — Disconnected"
 	toggleTitle := "Connect"
@@ -195,7 +261,15 @@ func (t *trayController) applyStatusUI(status app.TunnelStatusDTO, toggle *systr
 	switch status.State {
 	case string(sshclient.StateConnected):
 		icon = t.icons.connected
-		tooltip = fmt.Sprintf("tunssh — Connected (:%d / :%d)", status.SOCKSPort, status.HTTPPort)
+		if status.Mode == string(profile.ModeTUN) {
+			iface := t.tunCaps.IfaceName
+			if iface == "" {
+				iface = "tunssh0"
+			}
+			tooltip = fmt.Sprintf("tunssh — Connected (Full TUN: %s)", iface)
+		} else {
+			tooltip = fmt.Sprintf("tunssh — Connected (:%d / :%d)", status.SOCKSPort, status.HTTPPort)
+		}
 		toggleTitle = "Disconnect"
 	case string(sshclient.StateConnecting):
 		icon = t.icons.connecting
@@ -215,6 +289,29 @@ func (t *trayController) applyStatusUI(status app.TunnelStatusDTO, toggle *systr
 	systray.SetTooltip(tooltip)
 	if toggle != nil {
 		toggle.SetTitle(toggleTitle)
+	}
+
+	effectiveMode := selectedMode
+	if isActiveTunnelState(status.State) && (status.Mode == string(profile.ModeProxy) || status.Mode == string(profile.ModeTUN)) {
+		effectiveMode = status.Mode
+	}
+	if modeProxy != nil && modeTUN != nil {
+		if effectiveMode == string(profile.ModeTUN) && t.tunCaps.Supported {
+			modeProxy.Uncheck()
+			modeTUN.Check()
+		} else {
+			modeProxy.Check()
+			modeTUN.Uncheck()
+		}
+		if isActiveTunnelState(status.State) {
+			modeProxy.Disable()
+			modeTUN.Disable()
+		} else {
+			modeProxy.Enable()
+			if t.tunCaps.Supported {
+				modeTUN.Enable()
+			}
+		}
 	}
 }
 

@@ -8,12 +8,15 @@ import (
 	"fmt"
 	mathrand "math/rand/v2"
 	"net"
+	"net/netip"
 	"slices"
 	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
+	"unicode"
 
 	"golang.org/x/crypto/ssh"
 )
@@ -63,6 +66,12 @@ type ConnectConfig struct {
 	Watchdog      WatchdogConfig
 	BackoffBase   time.Duration
 	BackoffMax    time.Duration
+	// DialHost, when non-empty, overrides Host as the TCP dial target (e.g., pre-resolved VPS IP
+	// in TUN mode) while preserving Host:Port for TOFU host-key pinning, snapshots, and errors.
+	DialHost string
+	// DialControl, when non-nil and dialTCP is nil, is passed to net.Dialer.Control so TUN mode
+	// can bind the SSH transport socket to a physical egress interface before connecting.
+	DialControl func(network, address string, c syscall.RawConn) error
 }
 
 // EngineSnapshot is an immutable point-in-time view of engine state and telemetry.
@@ -460,12 +469,18 @@ func (e *Client) dialOnce(
 
 	dialFn := e.dialTCP
 	if dialFn == nil {
-		dialer := &net.Dialer{}
+		dialer := &net.Dialer{
+			Control: cfg.DialControl,
+		}
 		dialFn = dialer.DialContext
 	}
 
-	targetAddr := net.JoinHostPort(cfg.Host, strconv.Itoa(cfg.Port))
-	rawConn, err := dialFn(dialCtx, "tcp", targetAddr)
+	dialHost := cfg.Host
+	if cfg.DialHost != "" {
+		dialHost = cfg.DialHost
+	}
+	dialAddr := net.JoinHostPort(dialHost, strconv.Itoa(cfg.Port))
+	rawConn, err := dialFn(dialCtx, "tcp", dialAddr)
 	if err != nil {
 		return nil, nil, PhaseDial, err
 	}
@@ -497,7 +512,8 @@ func (e *Client) dialOnce(
 	stopClose := context.AfterFunc(dialCtx, func() {
 		_ = rawConn.Close()
 	})
-	sshConn, chans, reqs, err := ssh.NewClientConn(rawConn, targetAddr, sshCfg)
+	logicalAddr := net.JoinHostPort(cfg.Host, strconv.Itoa(cfg.Port))
+	sshConn, chans, reqs, err := ssh.NewClientConn(rawConn, logicalAddr, sshCfg)
 	stoppedCleanly := stopClose()
 
 	curPhase, _ := phaseVal.Load().(DialPhase)
@@ -727,6 +743,22 @@ func normalizeConnectConfig(cfg ConnectConfig) ConnectConfig {
 func validateConnectConfig(cfg ConnectConfig) error {
 	if strings.TrimSpace(cfg.Host) == "" {
 		return errors.New("sshclient: host must not be empty")
+	}
+	if cfg.DialHost != "" {
+		if strings.IndexFunc(cfg.DialHost, unicode.IsSpace) >= 0 {
+			return errors.New("sshclient: dial host must not contain whitespace")
+		}
+		if _, err := netip.ParseAddr(cfg.DialHost); err != nil {
+			if _, portStr, splitErr := net.SplitHostPort(cfg.DialHost); splitErr == nil {
+				if portStr == "" {
+					return errors.New("sshclient: dial host must not include an empty port")
+				}
+				return errors.New("sshclient: dial host must not include a port")
+			}
+			if strings.ContainsAny(cfg.DialHost, "[]") {
+				return errors.New("sshclient: dial host must not contain brackets")
+			}
+		}
 	}
 	if cfg.Port < 1 || cfg.Port > 65535 {
 		return fmt.Errorf("sshclient: invalid port %d", cfg.Port)

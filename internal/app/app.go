@@ -1,4 +1,4 @@
-// Package app orchestrates Milestone 1 SSH tunnel lifecycle, profiles, secrets,
+// Package app orchestrates SSH tunnel lifecycle, profiles, secrets,
 // crash recovery, share links, redacted logging, and frontend DTO contracts.
 package app
 
@@ -9,6 +9,7 @@ import (
 	"io"
 	"log/slog"
 	"net"
+	"net/netip"
 	"os"
 	"strconv"
 	"strings"
@@ -19,14 +20,16 @@ import (
 	"github.com/AlirezaDelkhahi/tunssh/internal/profile"
 	"github.com/AlirezaDelkhahi/tunssh/internal/proxy"
 	"github.com/AlirezaDelkhahi/tunssh/internal/recovery"
+	"github.com/AlirezaDelkhahi/tunssh/internal/splitroute"
 	"github.com/AlirezaDelkhahi/tunssh/internal/sshclient"
 	"github.com/AlirezaDelkhahi/tunssh/internal/sysproxy"
 )
 
 const (
-	defaultStatsInterval   = 1 * time.Second
-	defaultOpTimeout       = 5 * time.Second
-	maxPrivateKeyFileBytes = 256 * 1024
+	defaultStatsInterval      = 1 * time.Second
+	defaultOpTimeout          = 5 * time.Second
+	persistentTUNSetupTimeout = 30 * time.Second
+	maxPrivateKeyFileBytes    = 256 * 1024
 )
 
 // ProxyController abstracts the local SOCKS5/HTTP CONNECT proxy server lifecycle.
@@ -152,6 +155,7 @@ type BootstrapStateDTO struct {
 	VaultBackend string               `json:"vault_backend"`
 	VaultLocked  bool                 `json:"vault_locked"`
 	ProxyCaps    ProxyCapabilitiesDTO `json:"proxy_caps"`
+	TUNCaps      TUNCapsDTO           `json:"tun_caps"`
 	Status       TunnelStatusDTO      `json:"status"`
 	Profiles     []ProfileView        `json:"profiles"`
 	Recovery     *StartupRecoveryDTO  `json:"recovery"`
@@ -161,44 +165,50 @@ type BootstrapStateDTO struct {
 
 // Config injects all dependencies required by AppService without coupling to Wails or systray.
 type Config struct {
-	Profiles      profile.ProfileStore
-	Secrets       profile.SecretStore
-	Engine        sshclient.Engine
-	NewProxy      func(dialer proxy.Dialer, cfg proxy.Config) (ProxyController, error)
-	ProxyConfig   proxy.Config
-	SysProxy      sysproxy.SystemProxyManager
-	Restorer      *recovery.Restorer
-	Emitter       EventEmitter
-	Scrubber      *SecretScrubber
-	LogBuffer     *LogBuffer
-	Logger        *slog.Logger
-	FilePicker    func(ctx context.Context) (string, error)
-	StatsInterval time.Duration
-	DialTimeout   time.Duration
-	Watchdog      sshclient.WatchdogConfig
-	BackoffBase   time.Duration
-	BackoffMax    time.Duration
+	Profiles            profile.ProfileStore
+	Secrets             profile.SecretStore
+	Engine              sshclient.Engine
+	NewProxy            func(dialer proxy.Dialer, cfg proxy.Config) (ProxyController, error)
+	ProxyConfig         proxy.Config
+	SysProxy            sysproxy.SystemProxyManager
+	Restorer            *recovery.Restorer
+	TUN                 TUNSessionController
+	ResolvePeerIP       func(ctx context.Context, host string) (netip.Addr, error)
+	EnablePersistentTUN func(ctx context.Context) error
+	Emitter             EventEmitter
+	Scrubber            *SecretScrubber
+	LogBuffer           *LogBuffer
+	Logger              *slog.Logger
+	FilePicker          func(ctx context.Context) (string, error)
+	StatsInterval       time.Duration
+	DialTimeout         time.Duration
+	Watchdog            sshclient.WatchdogConfig
+	BackoffBase         time.Duration
+	BackoffMax          time.Duration
 }
 
-// AppService provides the headless Milestone 1 application facade bound by Wails and tests.
+// AppService provides the headless application facade bound by Wails and tests.
 type AppService struct {
-	profiles      profile.ProfileStore
-	secrets       profile.SecretStore
-	engine        sshclient.Engine
-	newProxy      func(dialer proxy.Dialer, cfg proxy.Config) (ProxyController, error)
-	proxyConfig   proxy.Config
-	sysProxy      sysproxy.SystemProxyManager
-	restorer      *recovery.Restorer
-	emitter       EventEmitter
-	scrubber      *SecretScrubber
-	logBuffer     *LogBuffer
-	logger        *slog.Logger
-	filePicker    func(ctx context.Context) (string, error)
-	statsInterval time.Duration
-	dialTimeout   time.Duration
-	watchdog      sshclient.WatchdogConfig
-	backoffBase   time.Duration
-	backoffMax    time.Duration
+	profiles            profile.ProfileStore
+	secrets             profile.SecretStore
+	engine              sshclient.Engine
+	newProxy            func(dialer proxy.Dialer, cfg proxy.Config) (ProxyController, error)
+	proxyConfig         proxy.Config
+	sysProxy            sysproxy.SystemProxyManager
+	restorer            *recovery.Restorer
+	tun                 TUNSessionController
+	resolvePeerIP       func(ctx context.Context, host string) (netip.Addr, error)
+	enablePersistentTUN func(ctx context.Context) error
+	emitter             EventEmitter
+	scrubber            *SecretScrubber
+	logBuffer           *LogBuffer
+	logger              *slog.Logger
+	filePicker          func(ctx context.Context) (string, error)
+	statsInterval       time.Duration
+	dialTimeout         time.Duration
+	watchdog            sshclient.WatchdogConfig
+	backoffBase         time.Duration
+	backoffMax          time.Duration
 
 	mu              sync.Mutex
 	lifecycleCtx    context.Context
@@ -213,6 +223,7 @@ type AppService struct {
 	activeMode      string
 	activeBypass    bool
 	activeProxy     ProxyController
+	activeTUN       bool
 	socksPort       int
 	httpPort        int
 	lastRecovery    *StartupRecoveryDTO
@@ -287,26 +298,38 @@ func NewAppService(cfg Config) (*AppService, error) {
 		statsInterval = defaultStatsInterval
 	}
 
+	resolvePeerIP := cfg.ResolvePeerIP
+	if resolvePeerIP == nil {
+		resolvePeerIP = splitroute.ResolveVPSPeerIP
+	}
+
+	enablePersistentTUN := cfg.EnablePersistentTUN
+	if enablePersistentTUN == nil && cfg.TUN != nil {
+		enablePersistentTUN = EnablePersistentTUNAccess
+	}
+
 	return &AppService{
-		profiles:      cfg.Profiles,
-		secrets:       cfg.Secrets,
-		engine:        cfg.Engine,
-		newProxy:      newProxy,
-		proxyConfig:   proxyCfg,
-		sysProxy:      cfg.SysProxy,
-		restorer:      cfg.Restorer,
-		emitter:       emitter,
-		scrubber:      scrubber,
-		logBuffer:     logBuffer,
-		logger:        logger,
-		filePicker:    cfg.FilePicker,
-		statsInterval: statsInterval,
-		dialTimeout:   cfg.DialTimeout,
-		watchdog:      cfg.Watchdog,
-		backoffBase:   cfg.BackoffBase,
-		backoffMax:    cfg.BackoffMax,
-		lifecycleCtx:  context.Background(),
-		activeMode:    string(profile.ModeProxy),
+		profiles:            cfg.Profiles,
+		secrets:             cfg.Secrets,
+		engine:              cfg.Engine,
+		newProxy:            newProxy,
+		proxyConfig:         proxyCfg,
+		sysProxy:            cfg.SysProxy,
+		restorer:            cfg.Restorer,
+		tun:                 cfg.TUN,
+		resolvePeerIP:       resolvePeerIP,
+		enablePersistentTUN: enablePersistentTUN,
+		emitter:             emitter,
+		scrubber:            scrubber,
+		logBuffer:           logBuffer,
+		logger:              logger,
+		filePicker:          cfg.FilePicker,
+		statsInterval:       statsInterval,
+		dialTimeout:         cfg.DialTimeout,
+		watchdog:            cfg.Watchdog,
+		backoffBase:         cfg.BackoffBase,
+		backoffMax:          cfg.BackoffMax,
+		lifecycleCtx:        context.Background(),
 	}, nil
 }
 
@@ -378,7 +401,13 @@ func (s *AppService) Shutdown(ctx context.Context) {
 		ctx = context.Background()
 	}
 	s.stopRuntimeLoops(ctx)
-	disconnCtx, cancel := boundedCleanupCtx(defaultOpTimeout)
+	timeout := s.cleanupTimeout()
+	if deadline, ok := ctx.Deadline(); ok {
+		if rem := time.Until(deadline); rem > timeout {
+			timeout = rem
+		}
+	}
+	disconnCtx, cancel := boundedCleanupCtx(timeout)
 	defer cancel()
 	_ = s.disconnect(disconnCtx)
 }
@@ -405,13 +434,24 @@ func (s *AppService) stopRuntimeLoops(ctx context.Context) {
 	}
 }
 
-// GetBootstrapState returns the initial state snapshot required to render the Milestone 1 UI.
+// GetBootstrapState returns the initial state snapshot required to render the UI.
 func (s *AppService) GetBootstrapState() (BootstrapStateDTO, error) {
 	profiles, err := s.ListProfiles()
 	if err != nil {
 		return BootstrapStateDTO{}, err
 	}
 	caps := s.sysProxy.Capabilities()
+
+	milestone := 1
+	tunEnabled := false
+	var tunCaps TUNCapsDTO
+	if s.tun != nil {
+		tunCaps = s.tun.Capabilities()
+		if tunCaps.Supported {
+			milestone = 2
+			tunEnabled = true
+		}
+	}
 
 	s.mu.Lock()
 	var recCopy *StartupRecoveryDTO
@@ -428,12 +468,36 @@ func (s *AppService) GetBootstrapState() (BootstrapStateDTO, error) {
 			AutoSupported: caps.AutoSupported,
 			DesktopEnv:    caps.DesktopEnv,
 		},
+		TUNCaps:    tunCaps,
 		Status:     s.buildStatusDTO(),
 		Profiles:   profiles,
 		Recovery:   recCopy,
-		Milestone:  1,
-		TUNEnabled: false,
+		Milestone:  milestone,
+		TUNEnabled: tunEnabled,
 	}, nil
+}
+
+// EnablePersistentTUNAccess grants persistent Linux capabilities (when supported) so Full TUN runs without elevation prompts.
+func (s *AppService) EnablePersistentTUNAccess() (string, error) {
+	if s.tun == nil {
+		return "", errors.New("Full TUN mode is not enabled")
+	}
+	caps := s.tun.Capabilities()
+	if caps.HasPersistentCap {
+		return "Persistent TUN capability is already active.", nil
+	}
+	if !caps.CanEnablePersistentCap || s.enablePersistentTUN == nil {
+		return "", errors.New("persistent TUN capability setup is not available on this platform")
+	}
+
+	ctx, cancel := boundedOpCtx(s.currentLifecycleCtx(), persistentTUNSetupTimeout)
+	defer cancel()
+	if err := s.enablePersistentTUN(ctx); err != nil {
+		s.logger.Warn("Failed to enable persistent TUN capability", "err", err)
+		return "", err
+	}
+	s.logger.Info("Persistent TUN capability enabled for current executable.")
+	return "Persistent TUN capability enabled. Restart tunssh to run Full TUN without elevation prompts.", nil
 }
 
 // UnlockVault unlocks the encrypted credential vault and loads active secrets into the log scrubber.
@@ -591,7 +655,7 @@ func (s *AppService) DeleteProfile(profileID string) error {
 	}
 
 	s.mu.Lock()
-	isActive := s.activeProfileID == profileID && (s.activeProxy != nil || s.dialCancel != nil)
+	isActive := s.activeProfileID == profileID && (s.activeProxy != nil || s.activeTUN || s.dialCancel != nil)
 	s.mu.Unlock()
 	if isActive {
 		_ = s.Disconnect()
@@ -643,7 +707,7 @@ func (s *AppService) ForgetHostKey(profileID string) (ProfileView, error) {
 	return s.ClearHostKey(profileID)
 }
 
-// TrustHostKeyAndConnect pins algorithm and sha256 onto profileID and starts System Proxy mode.
+// TrustHostKeyAndConnect pins algorithm and sha256 onto profileID and reconnects using the active or preferred mode.
 func (s *AppService) TrustHostKeyAndConnect(profileID string, algorithm string, sha256 string) error {
 	alg := strings.TrimSpace(algorithm)
 	fp := strings.TrimSpace(sha256)
@@ -664,17 +728,40 @@ func (s *AppService) TrustHostKeyAndConnect(profileID string, algorithm string, 
 		return err
 	}
 
+	s.mu.Lock()
+	targetMode := s.activeMode
+	if s.activeProfileID != "" && s.activeProfileID != profileID {
+		targetMode = ""
+	}
+	s.mu.Unlock()
+
+	if targetMode == "" {
+		if s.tun != nil && s.tun.Capabilities().Supported && p.PreferredMode == profile.ModeTUN {
+			targetMode = string(profile.ModeTUN)
+		} else {
+			targetMode = string(profile.ModeProxy)
+		}
+	} else if targetMode == string(profile.ModeTUN) && (s.tun == nil || !s.tun.Capabilities().Supported) {
+		targetMode = string(profile.ModeProxy)
+	}
+
 	s.logger.Info("Pinned server host key", "profile_id", profileID, "algorithm", alg, "sha256", fp)
-	return s.Connect(profileID, string(profile.ModeProxy))
+	return s.Connect(profileID, targetMode)
 }
 
-// Connect establishes the SSH tunnel, starts local SOCKS5/HTTP listeners, and enables OS system proxy.
+// Connect establishes the SSH tunnel in System Proxy ("proxy") or Full TUN ("tun") mode.
 func (s *AppService) Connect(profileID string, mode string) error {
 	trimmedMode := strings.TrimSpace(strings.ToLower(mode))
-	if trimmedMode == string(profile.ModeTUN) {
-		return errors.New("Full TUN mode is Milestone 2; System Proxy mode is active in Milestone 1")
-	}
-	if trimmedMode != "" && trimmedMode != string(profile.ModeProxy) {
+	targetMode := string(profile.ModeProxy)
+	switch trimmedMode {
+	case "", string(profile.ModeProxy):
+		targetMode = string(profile.ModeProxy)
+	case string(profile.ModeTUN):
+		if s.tun == nil || !s.tun.Capabilities().Supported {
+			return errors.New("Full TUN mode is Milestone 2; unavailable in current configuration")
+		}
+		targetMode = string(profile.ModeTUN)
+	default:
 		return fmt.Errorf("unsupported tunnel mode %q", mode)
 	}
 	if s.secrets.IsLocked() {
@@ -701,11 +788,13 @@ func (s *AppService) Connect(profileID string, mode string) error {
 	prevCancel := s.dialCancel
 	prevProxy := s.activeProxy
 	s.activeProxy = nil
+	prevTUN := s.activeTUN
+	s.activeTUN = false
 	dialCtx, dialCancel := context.WithCancel(baseCtx)
 	s.dialCancel = dialCancel
 	s.inDialSeq = mySeq
 	s.activeProfileID = prof.ID
-	s.activeMode = string(profile.ModeProxy)
+	s.activeMode = targetMode
 	s.activeBypass = prof.BypassIranLAN
 	s.socksPort = 0
 	s.httpPort = 0
@@ -735,11 +824,23 @@ func (s *AppService) Connect(profileID string, mode string) error {
 		_ = s.restorer.RestoreProxySession(stopCtx)
 		stopCancel()
 	}
+	if prevTUN && s.tun != nil {
+		stopCtx, stopCancel := boundedCleanupCtx(s.cleanupTimeout())
+		_ = s.stopAndCompleteTUN(stopCtx)
+		stopCancel()
+	}
 
 	if err := dialCtx.Err(); err != nil || !s.isConnectSeqCurrent(mySeq) {
 		return context.Canceled
 	}
 
+	if targetMode == string(profile.ModeTUN) {
+		return s.connectTUN(prof, sec, mySeq, dialCtx)
+	}
+	return s.connectProxy(prof, sec, mySeq, dialCtx, baseCtx)
+}
+
+func (s *AppService) buildSSHConnectConfig(prof profile.Profile, sec profile.ProfileSecrets) sshclient.ConnectConfig {
 	connectCfg := sshclient.ConnectConfig{
 		ProfileID: prof.ID,
 		Host:      prof.Host,
@@ -762,7 +863,17 @@ func (s *AppService) Connect(profileID string, mode string) error {
 			SHA256:    prof.PinnedHostKey.SHA256,
 		}
 	}
+	return connectCfg
+}
 
+func (s *AppService) connectProxy(
+	prof profile.Profile,
+	sec profile.ProfileSecrets,
+	mySeq uint64,
+	dialCtx context.Context,
+	baseCtx context.Context,
+) error {
+	connectCfg := s.buildSSHConnectConfig(prof, sec)
 	s.logger.Info("Connecting to SSH server...", "profile_id", prof.ID, "host", prof.Host, "port", prof.Port, "mode", profile.ModeProxy)
 
 	if err := s.engine.Connect(dialCtx, connectCfg); err != nil {
@@ -892,6 +1003,251 @@ func (s *AppService) Connect(profileID string, mode string) error {
 	return nil
 }
 
+func (s *AppService) connectTUN(
+	prof profile.Profile,
+	sec profile.ProfileSecrets,
+	mySeq uint64,
+	dialCtx context.Context,
+) error {
+	s.logger.Info("Connecting to SSH server...", "profile_id", prof.ID, "host", prof.Host, "port", prof.Port, "mode", profile.ModeTUN)
+
+	vpsIP, err := s.resolvePeerIP(dialCtx, prof.Host)
+	if err == nil && !vpsIP.IsValid() {
+		err = fmt.Errorf("resolved invalid IP address for host %q", prof.Host)
+	}
+	if err != nil {
+		s.clearInDial(mySeq)
+		if !s.isConnectSeqCurrent(mySeq) || dialCtx.Err() != nil {
+			return context.Canceled
+		}
+		s.logMappedError("Failed to resolve VPS peer IP for Full TUN mode", prof, s.engine.Snapshot(), err)
+		s.emitter.Emit("tunnel:status", s.buildStatusDTO())
+		return err
+	}
+	vpsIP = vpsIP.Unmap()
+
+	if !s.isConnectSeqCurrent(mySeq) || dialCtx.Err() != nil {
+		return context.Canceled
+	}
+
+	snap, err := s.tun.PrepareSession(dialCtx)
+	if err != nil {
+		s.clearInDial(mySeq)
+		if !s.isConnectSeqCurrent(mySeq) || dialCtx.Err() != nil {
+			return context.Canceled
+		}
+		s.logger.Error("Failed to prepare Full TUN session", "profile_id", prof.ID, "err", err)
+		s.emitter.Emit("tunnel:status", s.buildStatusDTO())
+		return err
+	}
+	if !s.isConnectSeqCurrent(mySeq) || dialCtx.Err() != nil {
+		s.cleanupStaleTUNBeforeCommit(mySeq, false)
+		return context.Canceled
+	}
+
+	caps := s.tun.Capabilities()
+	snap.VPSPeerIP = vpsIP.String()
+	if strings.TrimSpace(snap.TUNIfaceName) == "" {
+		if iface := strings.TrimSpace(caps.IfaceName); iface != "" {
+			snap.TUNIfaceName = iface
+		} else {
+			snap.TUNIfaceName = splitroute.TUNIfaceName
+		}
+	}
+	populateSnapshotInstalledRoutes(&snap, vpsIP, prof.BypassIranLAN)
+
+	connectCfg := s.buildSSHConnectConfig(prof, sec)
+	connectCfg.DialHost = vpsIP.String()
+	if !caps.RequiresElevation && snap.OrigIfaceName != "" {
+		connectCfg.DialControl = splitroute.BindToInterfaceControl(snap.OrigIfaceName, snap.OrigIfaceIndex, vpsIP.Is6())
+	}
+
+	if err := s.engine.Connect(dialCtx, connectCfg); err != nil {
+		s.clearInDial(mySeq)
+		s.cleanupStaleTUNBeforeCommit(mySeq, false)
+		if !s.isConnectSeqCurrent(mySeq) || dialCtx.Err() != nil {
+			return context.Canceled
+		}
+		engSnap := s.engine.Snapshot()
+		s.emitHostKeyPromptIfPresent(prof, engSnap, err)
+		s.logMappedError("SSH connection failed", prof, engSnap, err)
+		s.emitter.Emit("tunnel:status", s.buildStatusDTO())
+		return err
+	}
+
+	if !s.isConnectSeqCurrent(mySeq) || dialCtx.Err() != nil {
+		s.cleanupStaleTUNBeforeCommit(mySeq, true)
+		return context.Canceled
+	}
+
+	// Persist dirty TUN recovery state strictly before calling StartTUN (OS route/DNS mutations).
+	beginCtx, beginCancel := boundedOpCtx(dialCtx, defaultOpTimeout)
+	beginErr := s.restorer.BeginTUNSession(beginCtx, NetworkSnapshotToRecovery(snap))
+	beginCancel()
+	if beginErr != nil {
+		s.clearInDial(mySeq)
+		if !s.isConnectSeqCurrent(mySeq) || dialCtx.Err() != nil {
+			s.cleanupStaleTUNBeforeCommit(mySeq, true)
+			return context.Canceled
+		}
+		cleanCtx, cleanCancel := boundedCleanupCtx(s.cleanupTimeout())
+		_ = s.tun.Stop(cleanCtx)
+		if s.isConnectSeqCurrent(mySeq) {
+			_ = s.engine.Disconnect(cleanCtx)
+		}
+		cleanCancel()
+		s.logger.Error("Failed to persist Full TUN recovery state", "profile_id", prof.ID, "err", beginErr)
+		s.emitter.Emit("tunnel:status", s.buildStatusDTO())
+		return beginErr
+	}
+
+	if !s.isConnectSeqCurrent(mySeq) || dialCtx.Err() != nil {
+		s.cleanupStaleTUNAfterBegin(mySeq, nil)
+		return context.Canceled
+	}
+
+	tunReq := TUNStartRequest{
+		Snapshot:      snap,
+		BypassIranLAN: prof.BypassIranLAN,
+		EnableIPv6:    true,
+	}
+	if err := s.tun.StartTUN(dialCtx, tunReq, s.engine); err != nil {
+		s.clearInDial(mySeq)
+		if !s.isConnectSeqCurrent(mySeq) || dialCtx.Err() != nil {
+			s.cleanupStaleTUNAfterBegin(mySeq, err)
+			return context.Canceled
+		}
+		cleanCtx, cleanCancel := boundedCleanupCtx(s.cleanupTimeout())
+		_ = s.rollbackFailedTUNStart(cleanCtx, err)
+		if s.isConnectSeqCurrent(mySeq) {
+			_ = s.engine.Disconnect(cleanCtx)
+		}
+		cleanCancel()
+		s.logger.Error("Failed to start Full TUN session", "profile_id", prof.ID, "err", err)
+		s.emitter.Emit("tunnel:status", s.buildStatusDTO())
+		return err
+	}
+
+	s.mu.Lock()
+	if s.connectSeq != mySeq || dialCtx.Err() != nil {
+		if s.inDialSeq == mySeq {
+			s.inDialSeq = 0
+		}
+		disconnAfter := s.disconnectedSeq > mySeq
+		shouldCleanTUN := !s.activeTUN && (s.connectSeq == mySeq || disconnAfter || s.activeMode != string(profile.ModeTUN))
+		shouldDisconnEngine := disconnAfter || s.connectSeq == mySeq
+		s.mu.Unlock()
+		cleanCtx, cleanCancel := boundedCleanupCtx(s.cleanupTimeout())
+		if shouldCleanTUN {
+			_ = s.stopAndCompleteTUN(cleanCtx)
+		}
+		if shouldDisconnEngine {
+			_ = s.engine.Disconnect(cleanCtx)
+		}
+		cleanCancel()
+		return context.Canceled
+	}
+	s.activeTUN = true
+	s.activeProfileID = prof.ID
+	s.activeMode = string(profile.ModeTUN)
+	s.activeBypass = prof.BypassIranLAN
+	s.inDialSeq = 0
+	s.dialCancel = nil
+	s.mu.Unlock()
+
+	ifaceName := strings.TrimSpace(caps.IfaceName)
+	if ifaceName == "" {
+		ifaceName = strings.TrimSpace(snap.TUNIfaceName)
+	}
+	if ifaceName == "" {
+		ifaceName = splitroute.TUNIfaceName
+	}
+	tunDNS := strings.TrimSpace(caps.TUNDNS)
+	if tunDNS == "" {
+		tunDNS = splitroute.TUNDNSServer
+	}
+
+	s.logger.Info(
+		fmt.Sprintf("Connected to %s:%d via Full TUN (%s, DNS %s).", prof.Host, prof.Port, ifaceName, tunDNS),
+		"profile_id", prof.ID,
+		"iface", ifaceName,
+		"dns", tunDNS,
+	)
+	s.emitter.Emit("tunnel:status", s.buildStatusDTO())
+	return nil
+}
+
+func populateSnapshotInstalledRoutes(snap *splitroute.NetworkSnapshot, vpsIP netip.Addr, bypassIranLAN bool) {
+	if snap == nil {
+		return
+	}
+	origGW4, gwErr := parseOptionalIP(snap.OrigGateway, "orig_gateway")
+	if gwErr != nil || !origGW4.IsValid() {
+		return
+	}
+	origGW6, _ := parseOptionalIP(snap.OrigGateway6, "orig_gateway6")
+	origDNS := make([]netip.Addr, 0, len(snap.OrigDNSServers))
+	for _, rawDNS := range snap.OrigDNSServers {
+		trimmed := strings.TrimSpace(rawDNS)
+		if trimmed == "" {
+			continue
+		}
+		if host, _, splitErr := net.SplitHostPort(trimmed); splitErr == nil {
+			trimmed = host
+		}
+		if addr, parseErr := netip.ParseAddr(trimmed); parseErr == nil && addr.IsValid() {
+			origDNS = append(origDNS, addr.Unmap())
+		}
+	}
+	plan := splitroute.RoutePlan{
+		VPSPeerIP:      vpsIP,
+		OrigGateway:    origGW4,
+		OrigGateway6:   origGW6,
+		OrigIfaceName:  strings.TrimSpace(snap.OrigIfaceName),
+		OrigIfaceIndex: snap.OrigIfaceIndex,
+		OrigDNSServers: origDNS,
+		TUNIfaceName:   snap.TUNIfaceName,
+		BypassIranLAN:  bypassIranLAN,
+		EnableIPv6:     true,
+	}
+	if routes, routeErr := splitroute.BuildInstalledRoutes(plan); routeErr == nil {
+		snap.InstalledRoutes = routes
+	}
+}
+
+func (s *AppService) cleanupStaleTUNBeforeCommit(mySeq uint64, disconnectEngine bool) {
+	s.mu.Lock()
+	disconnAfter := s.disconnectedSeq > mySeq
+	shouldStopTUN := !s.activeTUN && (s.connectSeq == mySeq || disconnAfter || s.activeMode != string(profile.ModeTUN))
+	s.mu.Unlock()
+
+	ctx, cancel := boundedCleanupCtx(s.cleanupTimeout())
+	defer cancel()
+	if shouldStopTUN && s.tun != nil {
+		_ = s.tun.Stop(ctx)
+	}
+	if disconnectEngine && disconnAfter {
+		_ = s.engine.Disconnect(ctx)
+	}
+}
+
+func (s *AppService) cleanupStaleTUNAfterBegin(mySeq uint64, startErr error) {
+	s.mu.Lock()
+	disconnAfter := s.disconnectedSeq > mySeq
+	shouldCleanTUN := !s.activeTUN && (s.connectSeq == mySeq || disconnAfter || s.activeMode != string(profile.ModeTUN))
+	shouldDisconnEngine := disconnAfter || s.connectSeq == mySeq
+	s.mu.Unlock()
+
+	ctx, cancel := boundedCleanupCtx(s.cleanupTimeout())
+	defer cancel()
+	if shouldCleanTUN && s.tun != nil {
+		_ = s.rollbackFailedTUNStart(ctx, startErr)
+	}
+	if shouldDisconnEngine {
+		_ = s.engine.Disconnect(ctx)
+	}
+}
+
 func (s *AppService) rollbackFailedProxyStart(mySeq uint64, proxyCtrl ProxyController) {
 	ctx, cancel := boundedCleanupCtx(defaultOpTimeout)
 	defer cancel()
@@ -932,9 +1288,9 @@ func (s *AppService) isConnectSeqCurrent(seq uint64) bool {
 	return s.connectSeq == seq
 }
 
-// Disconnect cancels any active dial, stops the proxy server, restores OS proxy state, and closes SSH.
+// Disconnect cancels any active dial, stops the proxy or TUN session, restores OS network state, and closes SSH.
 func (s *AppService) Disconnect() error {
-	ctx, cancel := boundedCleanupCtx(defaultOpTimeout)
+	ctx, cancel := boundedCleanupCtx(s.cleanupTimeout())
 	defer cancel()
 	return s.disconnect(ctx)
 }
@@ -947,6 +1303,9 @@ func (s *AppService) disconnect(ctx context.Context) error {
 	s.dialCancel = nil
 	proxyCtrl := s.activeProxy
 	s.activeProxy = nil
+	wasTUN := s.activeTUN
+	s.activeTUN = false
+	s.activeMode = ""
 	s.socksPort = 0
 	s.httpPort = 0
 	s.lastRxBytes = 0
@@ -964,10 +1323,23 @@ func (s *AppService) disconnect(ctx context.Context) error {
 			errs = append(errs, err)
 			s.logger.Warn("Error stopping local proxy server", "err", err)
 		}
+		if err := s.restorer.RestoreProxySession(ctx); err != nil {
+			errs = append(errs, err)
+			s.logger.Warn("Error restoring OS proxy settings", "err", err)
+		}
 	}
-	if err := s.restorer.RestoreProxySession(ctx); err != nil {
-		errs = append(errs, err)
-		s.logger.Warn("Error restoring OS proxy settings", "err", err)
+	if wasTUN && s.tun != nil {
+		if err := s.tun.Stop(ctx); err != nil {
+			errs = append(errs, err)
+			s.logger.Warn("Error stopping Full TUN session", "err", err)
+			if restoreErr := s.restorer.RestoreTUNSession(ctx); restoreErr != nil {
+				errs = append(errs, restoreErr)
+				s.logger.Warn("Error restoring Full TUN network settings", "err", restoreErr)
+			}
+		} else if err := s.restorer.CompleteTUNSession(ctx); err != nil {
+			errs = append(errs, err)
+			s.logger.Warn("Error marking Full TUN recovery state clean", "err", err)
+		}
 	}
 	if err := s.engine.Disconnect(ctx); err != nil {
 		errs = append(errs, err)
@@ -981,7 +1353,11 @@ func (s *AppService) disconnect(ctx context.Context) error {
 
 // RestoreNetwork executes the panic-button flow: disconnects active tunnel state and restores OS network state.
 func (s *AppService) RestoreNetwork() error {
-	ctx, cancel := boundedCleanupCtx(defaultOpTimeout)
+	timeout := defaultOpTimeout
+	if s.tun != nil {
+		timeout = persistentTUNSetupTimeout
+	}
+	ctx, cancel := boundedCleanupCtx(timeout)
 	defer cancel()
 	disconnErr := s.disconnect(ctx)
 	restoreErr := s.restorer.RestoreNetwork(ctx)
@@ -999,7 +1375,7 @@ func (s *AppService) RestoreNetwork() error {
 	return errors.Join(disconnErr, restoreErr)
 }
 
-// SetBypassIranLAN updates BypassIranLAN on profileID and re-applies OS proxy bypass rules if connected.
+// SetBypassIranLAN updates BypassIranLAN on profileID and re-applies live OS proxy or TUN bypass rules if connected.
 func (s *AppService) SetBypassIranLAN(profileID string, bypass bool) (ProfileView, error) {
 	ctx := s.currentLifecycleCtx()
 	p, err := s.profiles.Get(ctx, profileID)
@@ -1014,16 +1390,27 @@ func (s *AppService) SetBypassIranLAN(profileID string, bypass bool) (ProfileVie
 	}
 
 	s.mu.Lock()
-	activeOnProfile := s.activeProxy != nil && s.activeProfileID == saved.ID && s.activeMode == string(profile.ModeProxy)
+	activeProxyOnProfile := s.activeProxy != nil && s.activeProfileID == saved.ID && s.activeMode == string(profile.ModeProxy)
+	activeTUNOnProfile := s.activeTUN && s.tun != nil && s.activeProfileID == saved.ID && s.activeMode == string(profile.ModeTUN)
 	proxyCtrl := s.activeProxy
 	socksPort := s.socksPort
 	httpPort := s.httpPort
-	if activeOnProfile {
+	if activeProxyOnProfile || activeTUNOnProfile {
 		s.activeBypass = bypass
 	}
 	s.mu.Unlock()
 
-	if activeOnProfile && proxyCtrl != nil {
+	rollbackBypass := func() {
+		saved.BypassIranLAN = prevBypass
+		_, _ = s.profiles.Save(ctx, saved)
+		s.mu.Lock()
+		if s.activeProfileID == saved.ID {
+			s.activeBypass = prevBypass
+		}
+		s.mu.Unlock()
+	}
+
+	if activeProxyOnProfile && proxyCtrl != nil {
 		socksHost, parsedSOCKS, errSOCKS := parseBoundAddr(proxyCtrl.SOCKSAddr(), sysproxy.DefaultLoopbackHost)
 		httpHost, parsedHTTP, errHTTP := parseBoundAddr(proxyCtrl.HTTPAddr(), sysproxy.DefaultLoopbackHost)
 		if errSOCKS == nil && errHTTP == nil {
@@ -1043,15 +1430,20 @@ func (s *AppService) SetBypassIranLAN(profileID string, bypass bool) (ProfileVie
 		})
 		enableCancel()
 		if enableErr != nil {
-			saved.BypassIranLAN = prevBypass
-			_, _ = s.profiles.Save(ctx, saved)
-			s.mu.Lock()
-			if s.activeProfileID == saved.ID {
-				s.activeBypass = prevBypass
-			}
-			s.mu.Unlock()
+			rollbackBypass()
 			s.logger.Warn("Failed to update live OS proxy bypass rules", "profile_id", saved.ID, "err", enableErr)
 			return ProfileView{}, enableErr
+		}
+	}
+
+	if activeTUNOnProfile {
+		enableCtx, enableCancel := boundedOpCtx(ctx, s.cleanupTimeout())
+		setErr := s.tun.SetBypass(enableCtx, bypass)
+		enableCancel()
+		if setErr != nil {
+			rollbackBypass()
+			s.logger.Warn("Failed to update live TUN bypass rules", "profile_id", saved.ID, "err", setErr)
+			return ProfileView{}, setErr
 		}
 	}
 
@@ -1255,11 +1647,16 @@ func (s *AppService) GetEnvSnippet() string {
 func (s *AppService) handleEngineSnapshot(snap sshclient.EngineSnapshot) {
 	s.mu.Lock()
 	inDial := s.inDialSeq != 0
-	var proxyCtrl ProxyController
+	var (
+		proxyCtrl ProxyController
+		wasTUN    bool
+	)
 	profileID := s.activeProfileID
 	if snap.State == sshclient.StateError && !inDial {
 		proxyCtrl = s.activeProxy
 		s.activeProxy = nil
+		wasTUN = s.activeTUN
+		s.activeTUN = false
 		s.socksPort = 0
 		s.httpPort = 0
 	}
@@ -1269,6 +1666,11 @@ func (s *AppService) handleEngineSnapshot(snap sshclient.EngineSnapshot) {
 		cleanCtx, cleanCancel := boundedCleanupCtx(defaultOpTimeout)
 		_ = proxyCtrl.Stop(cleanCtx)
 		_ = s.restorer.RestoreProxySession(cleanCtx)
+		cleanCancel()
+	}
+	if wasTUN && s.tun != nil {
+		cleanCtx, cleanCancel := boundedCleanupCtx(s.cleanupTimeout())
+		_ = s.stopAndCompleteTUN(cleanCtx)
 		cleanCancel()
 	}
 
@@ -1284,7 +1686,7 @@ func (s *AppService) handleEngineSnapshot(snap sshclient.EngineSnapshot) {
 	}
 
 	if inDial && snap.State == sshclient.StateConnected {
-		// Connect() emits the authoritative connected status once proxy + OS proxy are up.
+		// Connect() emits the authoritative connected status once proxy/TUN + OS config are up.
 		return
 	}
 
@@ -1302,7 +1704,7 @@ func (s *AppService) statsLoop(stop <-chan struct{}, done chan<- struct{}) {
 			return
 		case <-ticker.C:
 			s.mu.Lock()
-			ready := s.activeProxy != nil && s.inDialSeq == 0
+			ready := (s.activeProxy != nil || s.activeTUN) && s.inDialSeq == 0
 			seq := s.connectSeq
 			s.mu.Unlock()
 			if !ready {
@@ -1316,7 +1718,7 @@ func (s *AppService) statsLoop(stop <-chan struct{}, done chan<- struct{}) {
 			dto := s.buildStatusDTOFromSnap(snap, true)
 
 			s.mu.Lock()
-			stillSame := s.connectSeq == seq && s.activeProxy != nil && s.inDialSeq == 0
+			stillSame := s.connectSeq == seq && (s.activeProxy != nil || s.activeTUN) && s.inDialSeq == 0
 			s.mu.Unlock()
 			if !stillSame || dto.State != string(sshclient.StateConnected) {
 				continue
@@ -1333,6 +1735,7 @@ func (s *AppService) buildStatusDTO() TunnelStatusDTO {
 func (s *AppService) buildStatusDTOFromSnap(snap sshclient.EngineSnapshot, updateRates bool) TunnelStatusDTO {
 	s.mu.Lock()
 	proxyCtrl := s.activeProxy
+	activeTUN := s.activeTUN
 	activeProfileID := s.activeProfileID
 	activeMode := s.activeMode
 	boundSOCKS := s.socksPort
@@ -1351,6 +1754,16 @@ func (s *AppService) buildStatusDTOFromSnap(snap sshclient.EngineSnapshot, updat
 	txBytes := snap.TxBytes
 	if proxyStats.TxBytes > txBytes {
 		txBytes = proxyStats.TxBytes
+	}
+
+	if activeTUN && s.tun != nil {
+		tunStats := s.tun.Stats()
+		if tunStats.RxBytes > rxBytes {
+			rxBytes = tunStats.RxBytes
+		}
+		if tunStats.TxBytes > txBytes {
+			txBytes = tunStats.TxBytes
+		}
 	}
 
 	var rxRate, txRate uint64
@@ -1643,6 +2056,28 @@ func boundedOpCtx(parent context.Context, timeout time.Duration) (context.Contex
 		parent = context.Background()
 	}
 	return context.WithTimeout(parent, timeout)
+}
+
+func (s *AppService) cleanupTimeout() time.Duration {
+	if s.tun != nil {
+		return persistentTUNSetupTimeout
+	}
+	return defaultOpTimeout
+}
+
+func (s *AppService) stopAndCompleteTUN(ctx context.Context) error {
+	if err := s.tun.Stop(ctx); err != nil {
+		return errors.Join(err, s.restorer.RestoreTUNSession(ctx))
+	}
+	return s.restorer.CompleteTUNSession(ctx)
+}
+
+func (s *AppService) rollbackFailedTUNStart(ctx context.Context, startErr error) error {
+	stopErr := s.tun.Stop(ctx)
+	if stopErr != nil || errors.Is(startErr, ErrTUNRollbackIncomplete) {
+		return errors.Join(stopErr, s.restorer.RestoreTUNSession(ctx))
+	}
+	return s.restorer.CompleteTUNSession(ctx)
 }
 
 func boundedCleanupCtx(timeout time.Duration) (context.Context, context.CancelFunc) {

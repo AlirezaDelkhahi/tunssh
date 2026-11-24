@@ -28,11 +28,12 @@ import (
 )
 
 const (
-	windowsPipePrefix       = `\\.\pipe\tunssh-`
-	windowsPipeBufferSize   = 64 * 1024
-	windowsPipeOpenTimeout  = 2 * time.Second
-	windowsSeeMaskNoClose   = 0x00000040
-	windowsSddlAdminAndUser = "D:P(A;;GA;;;BA)(A;;GA;;;%s)"
+	windowsPipePrefix        = `\\.\pipe\tunssh-`
+	windowsPipeBufferSize    = 64 * 1024
+	windowsPipeOpenTimeout   = 2 * time.Second
+	windowsHelperReapTimeout = 5 * time.Second
+	windowsSeeMaskNoClose    = 0x00000040
+	windowsSddlAdminAndUser  = "D:P(A;;GA;;;BA)(A;;GA;;;%s)"
 )
 
 var (
@@ -188,6 +189,7 @@ func (l *windowsHelperLauncher) Launch(ctx context.Context) (io.ReadWriteCloser,
 	cleanup := func() {
 		cleanupOnce.Do(func() {
 			_ = conn.Close()
+			_, _ = windows.WaitForSingleObject(hProcess, uint32(windowsHelperReapTimeout/time.Millisecond))
 			_ = windows.CloseHandle(hProcess)
 		})
 	}

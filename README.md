@@ -108,9 +108,14 @@ Verify your download against `SHA256SUMS.txt`:
 sha256sum -c SHA256SUMS.txt --ignore-missing
 ```
 
-### Windows Status
+### Windows
 
-Windows release archives (`tunssh-<version>-windows-<arch>.zip`, bundling `tunssh.exe` and SHA-256-verified `wintun.dll` 0.14.1) are currently **opt-in** in [`.github/workflows/release.yml`](.github/workflows/release.yml) via manual `workflow_dispatch` (`include_windows: true`). Cross-compilation of the Windows binaries is verified on every CI run, while live runtime execution on Windows is still pending verification.
+Download `tunssh-<version>-windows-amd64.zip` (or `tunssh-<version>-windows-arm64.zip` on ARM64 Windows) from [GitHub Releases](https://github.com/AlirezaDelkhahi/tunssh/releases):
+
+1. Extract the `.zip` archive into a dedicated folder, keeping **`tunssh.exe`** and the bundled SHA-256-verified **`wintun.dll`** (`Wintun 0.14.1`) in the **same directory** (verify downloads against `SHA256SUMS.txt`).
+2. Ensure the **Microsoft Edge WebView2 Runtime** is installed (preinstalled on Windows 11 and modern Windows 10).
+3. Launch `tunssh.exe` as a standard user: **System Proxy** mode works unprivileged, while **Full TUN** prompts via Windows UAC to launch the elevated helper (`--tun-helper`).
+   *(Note: Windows builds are cross-compiled and verified via CI on every release; live Windows runtime smoke testing is still in progress.)*
 
 ---
 
@@ -161,9 +166,10 @@ Matches [`.github/workflows/ci.yml`](.github/workflows/ci.yml):
   sudo apt-get update
   sudo apt-get install -y libgtk-3-dev libwebkit2gtk-4.1-dev libayatana-appindicator3-dev pkg-config
   ```
-- **Optional (for `make package-linux`):**
+- **Optional (for `make package-linux` / Windows `.exe` icon & DPI manifest):**
   ```sh
   go install github.com/goreleaser/nfpm/v2/cmd/nfpm@latest
+  go install github.com/tc-hib/go-winres@latest
   ```
 
 ### Makefile Targets
@@ -182,7 +188,11 @@ make build-linux
 make package-linux
 
 # Fetch/verify Wintun 0.14.1 DLL and cross-compile Windows binary -> bin/tunssh.exe
+# (embeds packaging/winres/winres.json icon + DPI manifest when go-winres is installed)
 make build-windows
+
+# Package tunssh-<version>-windows-<arch>.zip (tunssh.exe + wintun.dll) and SHA256SUMS.txt -> dist/
+make package-windows
 
 # Remove bin/ and dist/
 make clean
@@ -207,7 +217,7 @@ tunssh/
 │   ├── sysproxy/             # OS system proxy backends (WinINet, GNOME gsettings, KDE, manual-env)
 │   └── tun/                  # tun2socks/v2 + gVisor stack over /dev/net/tun & SHA-256-verified Wintun
 ├── frontend/                 # Wails v2 React 18 + TypeScript + Vite 6 UI
-├── packaging/                # nfpm.yaml (.deb/.rpm/.pkg.tar.zst), fetch-wintun.sh, desktop entry & SVG
+├── packaging/                # nfpm.yaml (.deb/.rpm/.pkg.tar.zst), fetch-wintun.sh, winres, desktop entry & SVG
 ├── .github/workflows/        # CI (ci.yml) and multi-arch release pipeline (release.yml)
 └── ARCHITECTURE.md           # Detailed architectural blueprint and design invariants
 ```

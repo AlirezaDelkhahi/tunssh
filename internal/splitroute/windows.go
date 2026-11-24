@@ -12,6 +12,7 @@ import (
 	"net"
 	"net/netip"
 	"os/exec"
+	"path/filepath"
 	"slices"
 	"strconv"
 	"strings"
@@ -69,7 +70,17 @@ func NewWindowsManager(opts WindowsOptions) RouteManager {
 }
 
 func defaultWindowsRunCmd(ctx context.Context, name string, args ...string) (string, error) {
-	cmd := exec.CommandContext(ctx, name, args...)
+	resolved := name
+	if strings.EqualFold(name, "netsh") {
+		if sysDir, err := windows.GetSystemDirectory(); err == nil && sysDir != "" {
+			resolved = filepath.Join(sysDir, "netsh.exe")
+		}
+	}
+	cmd := exec.CommandContext(ctx, resolved, args...)
+	cmd.SysProcAttr = &syscall.SysProcAttr{
+		HideWindow:    true,
+		CreationFlags: windows.CREATE_NO_WINDOW,
+	}
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr

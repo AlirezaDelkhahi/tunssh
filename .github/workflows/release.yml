@@ -14,7 +14,7 @@ on:
         description: "Build Windows archives"
         required: false
         type: boolean
-        default: false
+        default: true
 
 permissions:
   contents: write
@@ -111,7 +111,7 @@ jobs:
 
   build-windows:
     name: Build Windows (${{ matrix.goarch }})
-    if: ${{ inputs.include_windows == true }}
+    if: ${{ github.event_name != 'workflow_dispatch' || inputs.include_windows }}
     runs-on: ubuntu-24.04
     strategy:
       fail-fast: false
@@ -157,14 +157,22 @@ jobs:
           npm ci
           npm run build
 
+      - name: Install go-winres
+        run: |
+          go install github.com/tc-hib/go-winres@latest
+          echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
+
       - name: Build and package Windows binary
         env:
           VERSION: ${{ steps.version.outputs.version }}
           GOARCH: ${{ matrix.goarch }}
         run: |
           mkdir -p bin dist
+          trap 'rm -f cmd/tunssh/rsrc_windows_*.syso' EXIT
+          go-winres make --in packaging/winres/winres.json --out cmd/tunssh/rsrc --arch "$GOARCH" --product-version "$VERSION" --file-version "$VERSION"
           ./packaging/fetch-wintun.sh "$GOARCH" bin
           GOOS=windows GOARCH="$GOARCH" CGO_ENABLED=0 go build -tags "desktop,production" -ldflags="-s -w -H windowsgui" -o bin/tunssh.exe ./cmd/tunssh
+          rm -f cmd/tunssh/rsrc_windows_*.syso
           (cd bin && zip -q "../dist/tunssh-${VERSION}-windows-${GOARCH}.zip" tunssh.exe wintun.dll)
 
       - name: Upload Windows artifacts

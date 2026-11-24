@@ -21,6 +21,7 @@ import (
 	"github.com/wailsapp/wails/v2"
 	"github.com/wailsapp/wails/v2/pkg/options"
 	"github.com/wailsapp/wails/v2/pkg/options/assetserver"
+	wailsWindows "github.com/wailsapp/wails/v2/pkg/options/windows"
 	wailsRuntime "github.com/wailsapp/wails/v2/pkg/runtime"
 )
 
@@ -292,6 +293,9 @@ func run() error {
 		BackgroundColour: &options.RGBA{R: 11, G: 15, B: 23, A: 255},
 		AssetServer: &assetserver.Options{
 			Assets: distFS,
+		},
+		Windows: &wailsWindows.Options{
+			Theme: wailsWindows.Dark,
 		},
 		Bind: []any{appSvc},
 		OnStartup: func(ctx context.Context) {

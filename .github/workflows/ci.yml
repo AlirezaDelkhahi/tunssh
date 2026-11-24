@@ -46,8 +46,9 @@ jobs:
       - name: Run Go tests
         run: go test -race -count=1 ./...
 
-      - name: Run Go vet
+      - name: Run Go vet and script checks
         run: |
+          bash -n packaging/fetch-wintun.sh
           go vet ./internal/...
           go vet -tags webkit2_41 ./...
 

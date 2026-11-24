@@ -10,7 +10,7 @@ homepage: https://github.com/AlirezaDelkhahi/tunssh
 license: MIT
 
 contents:
-  - src: ${BIN_PATH}
+  - src: bin/tunssh
     dst: /usr/bin/tunssh
     file_info:
       mode: 0755

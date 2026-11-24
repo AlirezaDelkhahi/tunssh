@@ -1,6 +1,5 @@
 VERSION ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo 0.1.0)
 CLEAN_VERSION := $(patsubst v%,%,$(VERSION))
-ARCH_VERSION := $(subst -,_,$(CLEAN_VERSION))
 GOARCH ?= $(shell go env GOARCH)
 WIN_GOARCH ?= amd64
 DIST_DIR ?= dist
@@ -35,9 +34,10 @@ package-linux: build-linux
 	cp packaging/tunssh.desktop "$$stage_dir/tunssh.desktop"; \
 	cp packaging/tunssh.svg "$$stage_dir/tunssh.svg"; \
 	tar -C "$$stage_dir" -czf $(DIST_DIR)/tunssh-$(VERSION)-linux-$(GOARCH).tar.gz tunssh tunssh.desktop tunssh.svg
-	VERSION=$(CLEAN_VERSION) GOARCH=$(GOARCH) BIN_PATH=$(BIN_PATH) nfpm package -f packaging/nfpm.yaml -p deb -t $(DIST_DIR)/
-	VERSION=$(CLEAN_VERSION) GOARCH=$(GOARCH) BIN_PATH=$(BIN_PATH) nfpm package -f packaging/nfpm.yaml -p rpm -t $(DIST_DIR)/
-	VERSION=$(ARCH_VERSION) GOARCH=$(GOARCH) BIN_PATH=$(BIN_PATH) nfpm package -f packaging/nfpm.yaml -p archlinux -t $(DIST_DIR)/
+	[ "$(BIN_PATH)" = "bin/tunssh" ] || cp -f "$(BIN_PATH)" bin/tunssh
+	for pkg in deb rpm archlinux; do \
+		VERSION=$(CLEAN_VERSION) GOARCH=$(GOARCH) nfpm package -f packaging/nfpm.yaml -p "$$pkg" -t $(DIST_DIR)/; \
+	done
 	cd $(DIST_DIR) && sha256sum *.tar.gz *.deb *.rpm *.pkg.tar.zst > SHA256SUMS.txt
 
 build-windows: frontend-build

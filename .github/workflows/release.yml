@@ -15,6 +15,11 @@ on:
         required: false
         type: boolean
         default: true
+      include_android:
+        description: "Build Android APKs"
+        required: false
+        type: boolean
+        default: true
 
 permissions:
   contents: write
@@ -182,12 +187,90 @@ jobs:
           path: dist/*.zip
           if-no-files-found: error
 
+  build-android:
+    name: Build Android (arm64 + universal)
+    if: ${{ github.event_name != 'workflow_dispatch' || inputs.include_android }}
+    runs-on: ubuntu-24.04
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Set up Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: "8.10.2"
+
+      - name: Resolve release version
+        id: version
+        env:
+          INPUT_VERSION: ${{ inputs.version }}
+        run: |
+          if [ -n "$INPUT_VERSION" ]; then
+            raw="$INPUT_VERSION"
+          elif [[ "${GITHUB_REF}" == refs/tags/* ]]; then
+            raw="${GITHUB_REF_NAME}"
+          else
+            raw="0.0.0-${GITHUB_SHA::7}"
+          fi
+          clean="${raw#v}"
+          echo "version=${clean}" >> "$GITHUB_OUTPUT"
+
+      - name: Set up Android SDK, NDK, and gomobile
+        run: |
+          SDK_ROOT="${ANDROID_HOME:-${ANDROID_SDK_ROOT:-/usr/local/lib/android/sdk}}"
+          echo "ANDROID_HOME=${SDK_ROOT}" >> "$GITHUB_ENV"
+          echo "ANDROID_SDK_ROOT=${SDK_ROOT}" >> "$GITHUB_ENV"
+          SDKMANAGER="${SDK_ROOT}/cmdline-tools/latest/bin/sdkmanager"
+          if [ ! -x "$SDKMANAGER" ]; then
+            SDKMANAGER="$(command -v sdkmanager)"
+          fi
+          yes | "$SDKMANAGER" --licenses >/dev/null || true
+          "$SDKMANAGER" "platform-tools" "platforms;android-35" "build-tools;35.0.0" "ndk;27.2.12479018"
+          echo "ANDROID_NDK_HOME=${SDK_ROOT}/ndk/27.2.12479018" >> "$GITHUB_ENV"
+          go install golang.org/x/mobile/cmd/gomobile@latest
+          go install golang.org/x/mobile/cmd/gobind@latest
+          GOPATH_BIN="$(go env GOPATH)/bin"
+          echo "${GOPATH_BIN}" >> "$GITHUB_PATH"
+          export PATH="${GOPATH_BIN}:${PATH}"
+          gomobile init
+
+      - name: Build and package Android APKs
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+          ANDROID_KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+        run: ./packaging/build-android.sh release
+
+      - name: Upload Android artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: android-apk
+          path: dist/*.apk
+          if-no-files-found: error
+
   release:
     name: Create Release Bundle
     needs:
       - build-linux
       - build-windows
-    if: ${{ !cancelled() && needs.build-linux.result == 'success' && (needs.build-windows.result == 'success' || needs.build-windows.result == 'skipped') }}
+      - build-android
+    if: ${{ !cancelled() && needs.build-linux.result == 'success' && (needs.build-windows.result == 'success' || needs.build-windows.result == 'skipped') && (needs.build-android.result == 'success' || needs.build-android.result == 'skipped') }}
     runs-on: ubuntu-24.04
 
     steps:

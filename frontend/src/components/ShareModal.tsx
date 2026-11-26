@@ -1,4 +1,5 @@
 import { useEffect, useRef, useState, type FormEvent } from "react";
+import QRCode from "qrcode";
 import type { ProfileView, ShareInspectDTO } from "../api/bridge";
 import { formatBridgeError } from "../api/bridge";
 import { copyToClipboard, evaluatePassphraseStrength } from "../utils/format";
@@ -34,6 +35,8 @@ interface ShareModalProps {
   ) => Promise<ProfileView>;
 }
 
+const MAX_QR_LINK_BYTES = 2200;
+
 export function ShareModal({
   open,
   profiles,
@@ -54,6 +57,8 @@ export function ShareModal({
   const [exportBusy, setExportBusy] = useState(false);
   const [generatedLink, setGeneratedLink] = useState("");
   const [generatedCopied, setGeneratedCopied] = useState(false);
+  const [qrDataUrl, setQrDataUrl] = useState("");
+  const [qrTooLarge, setQrTooLarge] = useState(false);
   const [exportError, setExportError] = useState<string | null>(null);
 
   // Import state
@@ -73,6 +78,10 @@ export function ShareModal({
 
   useEffect(() => {
     if (!open) {
+      setGeneratedLink("");
+      setGeneratedCopied(false);
+      setQrDataUrl("");
+      setQrTooLarge(false);
       return;
     }
     setTab(profiles.length > 0 ? "export" : "import");
@@ -83,6 +92,8 @@ export function ShareModal({
     setPlainRiskAccepted(false);
     setGeneratedLink("");
     setGeneratedCopied(false);
+    setQrDataUrl("");
+    setQrTooLarge(false);
     setExportError(null);
 
     setImportLink("");
@@ -117,6 +128,49 @@ export function ShareModal({
     const timer = window.setTimeout(() => setGeneratedCopied(false), 2200);
     return () => window.clearTimeout(timer);
   }, [generatedCopied]);
+
+  useEffect(() => {
+    if (!open || tab !== "export" || !generatedLink) {
+      setQrDataUrl("");
+      setQrTooLarge(false);
+      return undefined;
+    }
+
+    const linkBytes = new TextEncoder().encode(generatedLink).length;
+    if (linkBytes > MAX_QR_LINK_BYTES) {
+      setQrDataUrl("");
+      setQrTooLarge(true);
+      return undefined;
+    }
+
+    let cancelled = false;
+    setQrTooLarge(false);
+    setQrDataUrl("");
+
+    QRCode.toDataURL(generatedLink, {
+      errorCorrectionLevel: "M",
+      margin: 2,
+      width: 200,
+      color: {
+        dark: "#0B0F17",
+        light: "#FFFFFF",
+      },
+    })
+      .then((dataUrl) => {
+        if (!cancelled) {
+          setQrDataUrl(dataUrl);
+        }
+      })
+      .catch(() => {
+        if (!cancelled) {
+          setQrDataUrl("");
+        }
+      });
+
+    return () => {
+      cancelled = true;
+    };
+  }, [open, tab, generatedLink]);
 
   useEffect(() => {
     if (!open || tab !== "import") {
@@ -194,6 +248,10 @@ export function ShareModal({
 
     setExportBusy(true);
     setExportError(null);
+    setGeneratedLink("");
+    setGeneratedCopied(false);
+    setQrDataUrl("");
+    setQrTooLarge(false);
     try {
       const link = await onExport(
         selectedProfileId,
@@ -332,6 +390,10 @@ export function ShareModal({
                     onChange={(e) => {
                       setSelectedProfileId(e.target.value);
                       setGeneratedLink("");
+                      setGeneratedCopied(false);
+                      setQrDataUrl("");
+                      setQrTooLarge(false);
+                      setExportError(null);
                     }}
                   >
                     {profiles.map((p) => (
@@ -422,6 +484,24 @@ export function ShareModal({
                     <code className="share-result__preview" dir="ltr">
                       {generatedLink.slice(0, 56)}...
                     </code>
+                    {qrTooLarge ? (
+                      <p className="helper-note">
+                        This link exceeds QR capacity ({MAX_QR_LINK_BYTES}{" "}
+                        bytes). Copy and share the text link instead.
+                      </p>
+                    ) : (
+                      qrDataUrl && (
+                        <div className="share-qr">
+                          <img
+                            className="share-qr__img"
+                            src={qrDataUrl}
+                            alt="sshtun share QR code"
+                            width={200}
+                            height={200}
+                          />
+                        </div>
+                      )
+                    )}
                   </div>
                 )}
 

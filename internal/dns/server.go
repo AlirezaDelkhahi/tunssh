@@ -304,6 +304,7 @@ type Server struct {
 	udpAddr      string
 	tcpAddr      string
 	tunnelFwd    forwarder
+	bypassDialer Dialer
 	bypassFwd    forwarder
 	cache        *dnsCache
 	queryTimeout time.Duration
@@ -462,6 +463,7 @@ func (s *Server) Start(ctx context.Context, cfg DNSConfig) error {
 	s.udpAddr = pc.LocalAddr().String()
 	s.tcpAddr = ln.Addr().String()
 	s.tunnelFwd = tunnelFwd
+	s.bypassDialer = cfg.BypassDialer
 	s.bypassFwd = bypassFwd
 	s.cache = cache
 	s.queryTimeout = queryTimeout
@@ -642,6 +644,7 @@ func (s *Server) Stop(ctx context.Context) error {
 		s.udpServer = nil
 		s.tcpServer = nil
 		s.tunnelFwd = nil
+		s.bypassDialer = nil
 		s.bypassFwd = nil
 		s.runCancel = nil
 		s.mu.Unlock()
@@ -660,6 +663,37 @@ func (s *Server) SetBypassIranLAN(bypass bool) {
 	if prev != bypass {
 		s.FlushCache()
 	}
+}
+
+// UpdateBypassUpstreams validates and replaces the bypass DNS upstreams on a running server
+// without changing listener addresses, and flushes the DNS cache.
+func (s *Server) UpdateBypassUpstreams(upstreams []string) error {
+	norm, err := prepareBypassUpstreams(upstreams)
+	if err != nil {
+		return err
+	}
+
+	s.mu.Lock()
+	if !s.running || s.stopping {
+		s.mu.Unlock()
+		return errors.New("dns: server not started")
+	}
+	var newFwd forwarder
+	if s.bypassDialer != nil && len(norm) > 0 {
+		newFwd = newBypassForwarder(s.bypassDialer, norm, s.queryTimeout)
+	}
+	oldFwd := s.bypassFwd
+	s.bypassFwd = newFwd
+	cache := s.cache
+	s.mu.Unlock()
+
+	if oldFwd != nil {
+		_ = oldFwd.Close()
+	}
+	if cache != nil {
+		cache.flush()
+	}
+	return nil
 }
 
 // FlushCache removes all entries from the DNS response cache.

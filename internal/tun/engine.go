@@ -540,23 +540,56 @@ func (r *dnsRedirectPacketConn) Close() error {
 	return r.closeErr
 }
 
+type postWaitCloser interface {
+	CloseBeforeWait()
+	CloseAfterWait()
+}
+
 // onceCloseDevice guards device.Device.Close() with sync.Once because both Runner.Stop
 // and gVisor stack.Wait (via removeNICLocked) invoke Close() during teardown; double-closing
 // an OS TUN file descriptor would introduce an fd-reuse race.
 type onceCloseDevice struct {
 	device.Device
-	closeOnce sync.Once
+	closeOnce  sync.Once
+	beforeOnce sync.Once
+	afterOnce  sync.Once
 }
 
 func (d *onceCloseDevice) Close() {
 	d.closeOnce.Do(func() {
+		if pwc, ok := d.Device.(postWaitCloser); ok {
+			pwc.CloseBeforeWait()
+			pwc.CloseAfterWait()
+			return
+		}
 		d.Device.Close()
+	})
+}
+
+func (d *onceCloseDevice) CloseBeforeWait() {
+	d.beforeOnce.Do(func() {
+		if pwc, ok := d.Device.(postWaitCloser); ok {
+			pwc.CloseBeforeWait()
+			return
+		}
+		d.Close()
+	})
+}
+
+func (d *onceCloseDevice) CloseAfterWait() {
+	d.afterOnce.Do(func() {
+		if pwc, ok := d.Device.(postWaitCloser); ok {
+			pwc.CloseAfterWait()
+			return
+		}
+		d.Close()
 	})
 }
 
 // Runner owns the active TUN device, tun2socks Tunnel, and gVisor netstack lifecycle.
 type Runner struct {
-	openDevice deviceOpener
+	openDevice    deviceOpener
+	cleanupUnused func()
 
 	mu         sync.Mutex
 	starting   bool
@@ -580,6 +613,20 @@ func newRunnerWithOpener(opener deviceOpener) *Runner {
 	return &Runner{openDevice: opener}
 }
 
+func (r *Runner) consumeCleanupUnused() {
+	r.mu.Lock()
+	if r.starting || r.running || r.stopping {
+		r.mu.Unlock()
+		return
+	}
+	cleanup := r.cleanupUnused
+	r.cleanupUnused = nil
+	r.mu.Unlock()
+	if cleanup != nil {
+		cleanup()
+	}
+}
+
 // Start validates cfg, opens and configures the OS TUN device, starts the tun2socks tunnel,
 // attaches the gVisor stack, and returns the resulting OS interface index.
 func (r *Runner) Start(ctx context.Context, cfg Config) (int, error) {
@@ -587,11 +634,13 @@ func (r *Runner) Start(ctx context.Context, cfg Config) (int, error) {
 		ctx = context.Background()
 	}
 	if err := ctx.Err(); err != nil {
+		r.consumeCleanupUnused()
 		return 0, err
 	}
 
 	normCfg, err := normalizeRunnerConfig(cfg)
 	if err != nil {
+		r.consumeCleanupUnused()
 		return 0, err
 	}
 
@@ -601,11 +650,18 @@ func (r *Runner) Start(ctx context.Context, cfg Config) (int, error) {
 		return 0, errors.New("tun: runner is already active or stopping")
 	}
 	if r.openDevice == nil {
+		cleanup := r.cleanupUnused
+		r.cleanupUnused = nil
 		r.mu.Unlock()
+		if cleanup != nil {
+			cleanup()
+		}
 		return 0, errors.New("tun: device opener must not be nil")
 	}
 	r.starting = true
 	opener := r.openDevice
+	cleanup := r.cleanupUnused
+	r.cleanupUnused = nil
 	r.mu.Unlock()
 
 	var (
@@ -619,8 +675,16 @@ func (r *Runner) Start(ctx context.Context, cfg Config) (int, error) {
 		if committed {
 			return
 		}
+		var pwc postWaitCloser
 		if wrappedDev != nil {
-			wrappedDev.Close()
+			if p, ok := wrappedDev.(postWaitCloser); ok && st != nil {
+				pwc = p
+				pwc.CloseBeforeWait()
+			} else {
+				wrappedDev.Close()
+			}
+		} else if cleanup != nil {
+			cleanup()
 		}
 		if st != nil {
 			st.Close()
@@ -630,6 +694,9 @@ func (r *Runner) Start(ctx context.Context, cfg Config) (int, error) {
 		}
 		if st != nil {
 			st.Wait()
+		}
+		if pwc != nil {
+			pwc.CloseAfterWait()
 		}
 		if tunInst != nil {
 			tunInst.Close()
@@ -712,6 +779,7 @@ func (r *Runner) Stop(ctx context.Context) error {
 			return errors.New("tun: cannot stop while start is in progress")
 		}
 		r.mu.Unlock()
+		r.consumeCleanupUnused()
 		return nil
 	}
 
@@ -733,8 +801,16 @@ func (r *Runner) Stop(ctx context.Context) error {
 
 	// Close the link device, stack, and active proxy sockets before stopping
 	// tunnel.ProcessAsync() so active sessions unblock and queued handlers drain cleanly.
+	// For postWaitCloser devices (e.g., fdDevice), defer closing the underlying FD strictly
+	// until after st.Wait() finishes so st.Close() and stack teardown never touch a closed FD.
+	var pwc postWaitCloser
 	if dev != nil {
-		dev.Close()
+		if p, ok := dev.(postWaitCloser); ok && st != nil {
+			pwc = p
+			pwc.CloseBeforeWait()
+		} else {
+			dev.Close()
+		}
 	}
 	if st != nil {
 		st.Close()
@@ -747,6 +823,9 @@ func (r *Runner) Stop(ctx context.Context) error {
 	go func() {
 		if st != nil {
 			st.Wait()
+		}
+		if pwc != nil {
+			pwc.CloseAfterWait()
 		}
 		close(waitDone)
 	}()

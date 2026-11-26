@@ -1287,3 +1287,74 @@ func TestStartCancellationDoesNotDeadlock(t *testing.T) {
 		}
 	}
 }
+
+func TestUpdateBypassUpstreams(t *testing.T) {
+	tunnelDialer := &mockDialer{
+		fn: func(_ context.Context, _, _ string) (net.Conn, error) {
+			return serveTCPPipe(func(req *mdns.Msg) *mdns.Msg {
+				return makeAReply(req, "198.51.100.200", 60)
+			}), nil
+		},
+	}
+	bypassDialer := &mockDialer{
+		fn: func(_ context.Context, _, address string) (net.Conn, error) {
+			return serveUDPPipe(func(req *mdns.Msg) *mdns.Msg {
+				if address == "192.0.2.2:53" {
+					return makeAReply(req, "185.2.2.2", 60)
+				}
+				return makeAReply(req, "185.1.1.1", 60)
+			}), nil
+		},
+	}
+
+	srv := NewServer()
+	if err := srv.Start(context.Background(), DNSConfig{
+		ListenAddr:      "127.0.0.1:0",
+		TunnelDialer:    tunnelDialer,
+		BypassDialer:    bypassDialer,
+		BypassUpstreams: []string{"192.0.2.1"},
+		BypassIranLAN:   true,
+	}); err != nil {
+		t.Fatalf("Start() error = %v", err)
+	}
+	defer srv.Stop(context.Background())
+
+	req := new(mdns.Msg)
+	req.SetQuestion("bank.ir.", mdns.TypeA)
+	resp, err := srv.Exchange(context.Background(), req)
+	if err != nil {
+		t.Fatalf("first Exchange error = %v", err)
+	}
+	if ip, _ := extractFirstA(t, resp); ip != "185.1.1.1" {
+		t.Fatalf("first Exchange IP = %s, want 185.1.1.1", ip)
+	}
+
+	// Invalid upstream must fail without breaking existing bypass forwarding.
+	if err := srv.UpdateBypassUpstreams([]string{"1.2.3.4:"}); err == nil {
+		t.Fatal("expected invalid upstream to return error")
+	}
+
+	// Updating to a new upstream must flush cache and route subsequent queries to new upstream.
+	if err := srv.UpdateBypassUpstreams([]string{"192.0.2.2"}); err != nil {
+		t.Fatalf("UpdateBypassUpstreams error = %v", err)
+	}
+	resp2, err := srv.Exchange(context.Background(), req)
+	if err != nil {
+		t.Fatalf("second Exchange error = %v", err)
+	}
+	if ip, _ := extractFirstA(t, resp2); ip != "185.2.2.2" {
+		t.Fatalf("second Exchange IP = %s, want 185.2.2.2", ip)
+	}
+
+	// Empty upstreams cleanly clears bypassFwd and falls back to tunnelFwd.
+	if err := srv.UpdateBypassUpstreams(nil); err != nil {
+		t.Fatalf("UpdateBypassUpstreams(nil) error = %v", err)
+	}
+	resp3, err := srv.Exchange(context.Background(), req)
+	if err != nil {
+		t.Fatalf("third Exchange error = %v", err)
+	}
+	if ip, _ := extractFirstA(t, resp3); ip != "198.51.100.200" {
+		t.Fatalf("third Exchange IP = %s, want 198.51.100.200", ip)
+	}
+}

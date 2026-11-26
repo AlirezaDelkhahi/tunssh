@@ -1961,6 +1961,29 @@ kbd {
   word-break: break-all;
 }
 
+.share-qr {
+  align-self: center;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+  margin-top: 4px;
+  padding: 8px;
+  border-radius: var(--radius-sm);
+  background-color: #ffffff;
+  border: 1px solid rgba(255, 255, 255, 0.9);
+  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.28);
+}
+
+.share-qr__img {
+  display: block;
+  width: 200px;
+  max-width: 100%;
+  height: auto;
+  aspect-ratio: 1 / 1;
+  image-rendering: pixelated;
+}
+
 .advanced-box {
   border: 1px solid var(--border-subtle);
   border-radius: var(--radius-md);

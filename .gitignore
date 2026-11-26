@@ -20,3 +20,17 @@ frontend/dist/*
 recovery_state.json
 profiles.json
 secrets.enc
+
+# Android / Gradle build & signing artifacts
+android/.gradle/
+android/build/
+android/app/build/
+android/app/libs/*.aar
+android/local.properties
+android/.idea/
+*.apk
+*.aab
+*.keystore
+*.jks
+*.p12
+*.b64

@@ -1,0 +1,13 @@
+tunssh is a minimalist SSH VPN tunnel client that turns any stock Linux OpenSSH server (sshd with AllowTcpForwarding yes) into a secure Android VPN — no custom server daemon, agent, or proprietary protocol required.
+
+Key Features:
+
+- Zero Server-Side Setup: Connects directly to standard OpenSSH using password, PAM keyboard-interactive, or OpenSSH/PEM/PKCS#8 private key authentication (ed25519, ecdsa, rsa).
+- Loop-Free Android VpnService: Routes device TCP traffic through tun2socks (gVisor netstack) over an SSH session protected with VpnService.protect.
+- Embedded Split DNS Resolver: Intercepts VPN port 53 queries via an embedded miekg/dns server, forwarding general lookups over encrypted SSH DNS-over-TCP and routing .ir and local domains directly when Bypass Iran & LAN is enabled.
+- Bypass Iran & LAN: Live toggleable split routing that keeps RFC 1918 local networks and Iranian IPv4 CIDRs direct while tunneling all other traffic.
+- Per-App Split Tunneling: Select which installed apps bypass or traverse the SSH VPN tunnel.
+- Mandatory TOFU Host-Key Pinning: Verifies server SHA-256 fingerprints on first connect and blocks unexpected host-key changes instead of silently trusting them.
+- Encrypted Share Links & Offline QR Codes: Import and export profiles via sshtun://v1/ links protected by Argon2id + AES-256-GCM, Android sshtun:// deep-links, or offline QR code export and camera/image scanning.
+- Hardware Keystore Protection: Stores passwords, private keys, and passphrases encrypted with AndroidKeyStore; profiles and logs never expose raw secrets.
+- Resilient Engine & Quick Controls: Includes an active SSH keepalive watchdog, bounded reconnect backoff, redacted live diagnostic logs, and an Android Quick Settings tile.

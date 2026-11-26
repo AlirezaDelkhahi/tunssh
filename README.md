@@ -1,8 +1,8 @@
 # tunssh
 
-**`tunssh` is a minimalist, 1-click desktop SSH tunnel client that turns any stock OpenSSH server into a secure system-wide tunnel — no custom server daemon or agent required.**
+**`tunssh` is a minimalist, 1-click SSH tunnel client for desktop and Android that turns any stock OpenSSH server into a secure system-wide tunnel — no custom server daemon or agent required.**
 
-Built with **Go**, **Wails v2**, and **React / TypeScript**, `tunssh` runs as a compact dark-first desktop app (`460×680`) with system tray integration and two traffic modes: an unprivileged **System Proxy Mode** and a full-device **Full TUN Mode**.
+On desktop (Linux and Windows), `tunssh` is built with **Go**, **Wails v2**, and **React / TypeScript**, running as a compact dark-first app (`460×680`) with system tray integration and two traffic modes: an unprivileged **System Proxy Mode** and a full-device **Full TUN Mode**. On Android, a **Jetpack Compose** / **`VpnService`** client embeds the shared Go SSH, embedded DNS, and `tun2socks` core via `gomobile`.
 
 ---
 
@@ -117,6 +117,15 @@ Download `tunssh-<version>-windows-amd64.zip` (or `tunssh-<version>-windows-arm6
 3. Launch `tunssh.exe` as a standard user: **System Proxy** mode works unprivileged, while **Full TUN** prompts via Windows UAC to launch the elevated helper (`--tun-helper`).
    *(Note: Windows builds are cross-compiled and verified via CI on every release; live Windows runtime smoke testing is still in progress.)*
 
+### Android
+
+Download `tunssh-<version>-android-arm64.apk` (recommended for modern phones) or `tunssh-<version>-android-universal.apk` from [GitHub Releases](https://github.com/AlirezaDelkhahi/tunssh/releases) and verify against `SHA256SUMS.txt` (`sha256sum -c SHA256SUMS.txt --ignore-missing`):
+
+- **Loop-Free `VpnService` Routing:** Connects over SSH using `VpnService.protect` socket protection, `tun2socks/v2`, and the embedded `miekg/dns` resolver (`Bypass Iran & LAN` supported).
+- **Per-App Split Tunneling:** Select which installed Android apps traverse or bypass the VPN tunnel.
+- **Share Links, QR Codes & Keystore Protection:** Supports `sshtun://v1/` share-link import (deep-links plus desktop↔Android offline QR code export and camera/image scanning) and protects stored profile credentials with the Android Keystore.
+- **APK Signing & Store Metadata:** Release APKs are signed with an ad-hoc/CI release key unless repository maintainers run `./packaging/generate-android-keystore.sh` and configure the `ANDROID_KEYSTORE_BASE64`, `ANDROID_KEYSTORE_PASSWORD`, `ANDROID_KEY_ALIAS`, and `ANDROID_KEY_PASSWORD` GitHub Actions secrets. F-Droid / IzzyOnDroid Fastlane metadata lives in [`fastlane/metadata/android/en-US/`](fastlane/metadata/android/en-US/).
+
 ---
 
 ## Quick Start & OpenSSH Server Setup
@@ -172,6 +181,15 @@ Matches [`.github/workflows/ci.yml`](.github/workflows/ci.yml):
   go install github.com/tc-hib/go-winres@latest
   ```
 
+### Prerequisites (Android)
+
+Matches the `android-ci` job in [`.github/workflows/ci.yml`](.github/workflows/ci.yml):
+
+- **Go:** `1.26.3` with `gomobile` and `gobind` in `PATH` (`gomobile init` run once)
+- **Java:** `17` (Temurin or compatible JDK)
+- **Gradle:** `8.10.2` (or `./android/gradlew` when present)
+- **Android SDK & NDK:** Android SDK API `35` (`platforms;android-35`, `build-tools;35.0.0`) and Android NDK (`ANDROID_HOME` / `ANDROID_SDK_ROOT` and `ANDROID_NDK_HOME`)
+
 ### Makefile Targets
 
 ```sh
@@ -193,6 +211,15 @@ make build-windows
 
 # Package tunssh-<version>-windows-<arch>.zip (tunssh.exe + wintun.dll) and SHA256SUMS.txt -> dist/
 make package-windows
+
+# Build Android AAR bridge -> android/app/libs/tunssh.aar
+make build-android-aar
+
+# Build Android AAR (when needed) and debug APK -> dist/
+make build-android
+
+# Build Android AAR and release APKs (arm64 + universal) + SHA256SUMS.txt -> dist/
+make package-android
 
 # Remove bin/ and dist/
 make clean
@@ -216,8 +243,11 @@ tunssh/
 │   ├── sshclient/            # SSH engine, PAM/key auth, TOFU pinning, watchdog, Iran-aware errors
 │   ├── sysproxy/             # OS system proxy backends (WinINet, GNOME gsettings, KDE, manual-env)
 │   └── tun/                  # tun2socks/v2 + gVisor stack over /dev/net/tun & SHA-256-verified Wintun
+├── mobile/                   # gomobile-compatible Android bridge over Go SSH/DNS/TUN/share packages
+├── android/                  # Jetpack Compose + VpnService Android client and Quick Settings tile
+├── fastlane/                 # F-Droid / IzzyOnDroid metadata (fastlane/metadata/android/en-US/)
 ├── frontend/                 # Wails v2 React 18 + TypeScript + Vite 6 UI
-├── packaging/                # nfpm.yaml (.deb/.rpm/.pkg.tar.zst), fetch-wintun.sh, winres, desktop entry & SVG
+├── packaging/                # nfpm.yaml, fetch-wintun.sh, build-android.sh, generate-android-keystore.sh, winres, desktop entry & SVG
 ├── .github/workflows/        # CI (ci.yml) and multi-arch release pipeline (release.yml)
 └── ARCHITECTURE.md           # Detailed architectural blueprint and design invariants
 ```

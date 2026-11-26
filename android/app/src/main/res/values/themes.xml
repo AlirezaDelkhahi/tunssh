@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <style name="Theme.TunSsh" parent="android:Theme.Material.NoActionBar">
+        <item name="android:windowBackground">@color/tunssh_bg_canvas</item>
+        <item name="android:colorBackground">@color/tunssh_bg_canvas</item>
+        <item name="android:statusBarColor">@color/tunssh_bg_canvas</item>
+        <item name="android:navigationBarColor">@color/tunssh_bg_canvas</item>
+        <item name="android:windowLightStatusBar">false</item>
+    </style>
+
+    <color name="tunssh_bg_canvas">#0B0F17</color>
+</resources>

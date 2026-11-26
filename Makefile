@@ -5,11 +5,11 @@ WIN_GOARCH ?= amd64
 DIST_DIR ?= dist
 BIN_PATH ?= bin/tunssh
 
-.PHONY: frontend-build test vet build-linux package-linux build-windows package-windows clean
+.PHONY: frontend-build test vet build-linux package-linux build-windows package-windows build-android-aar build-android package-android clean
 
 define write_dist_checksums
 	cd $(DIST_DIR) && { \
-		for f in *.tar.gz *.deb *.rpm *.pkg.tar.zst *.zip; do \
+		for f in *.tar.gz *.deb *.rpm *.pkg.tar.zst *.zip *.apk; do \
 			if [ -e "$$f" ]; then sha256sum "$$f"; fi; \
 		done; \
 	} > SHA256SUMS.tmp && mv SHA256SUMS.tmp SHA256SUMS.txt
@@ -69,6 +69,16 @@ package-windows: build-windows
 	else \
 		python3 -m zipfile -c "$$zip_out" tunssh.exe wintun.dll; \
 	fi
+	$(call write_dist_checksums)
+
+build-android-aar:
+	./packaging/build-android.sh aar
+
+build-android:
+	./packaging/build-android.sh debug
+
+package-android:
+	VERSION=$(CLEAN_VERSION) DIST_DIR=$(abspath $(DIST_DIR)) ./packaging/build-android.sh release
 	$(call write_dist_checksums)
 
 clean:

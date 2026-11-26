@@ -49,6 +49,8 @@ jobs:
       - name: Run Go vet and script checks
         run: |
           bash -n packaging/fetch-wintun.sh
+          bash -n packaging/build-android.sh
+          bash -n packaging/generate-android-keystore.sh
           go vet ./internal/...
           go vet -tags webkit2_41 ./...
 
@@ -63,3 +65,65 @@ jobs:
           GOOS=windows GOARCH=amd64 CGO_ENABLED=0 go build -tags "desktop,production" -ldflags="-s -w -H windowsgui" -o /tmp/tunssh-amd64.exe ./cmd/tunssh
           GOOS=windows GOARCH=arm64 CGO_ENABLED=0 go build ./internal/...
           GOOS=windows GOARCH=arm64 CGO_ENABLED=0 go build -tags "desktop,production" -ldflags="-s -w -H windowsgui" -o /tmp/tunssh-arm64.exe ./cmd/tunssh
+
+      - name: Cross-compile check Android (arm64)
+        run: |
+          GOOS=android GOARCH=arm64 CGO_ENABLED=0 go vet ./internal/crypto ./internal/sshclient ./internal/dns ./internal/tun ./internal/splitroute ./mobile
+          GOOS=android GOARCH=arm64 CGO_ENABLED=0 go build ./internal/crypto ./internal/sshclient ./internal/dns ./internal/tun ./internal/splitroute ./mobile
+
+  android-ci:
+    name: Build & Test (Android)
+    runs-on: ubuntu-24.04
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Set up Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: "8.10.2"
+
+      - name: Set up Android SDK, NDK, and gomobile
+        run: |
+          SDK_ROOT="${ANDROID_HOME:-${ANDROID_SDK_ROOT:-/usr/local/lib/android/sdk}}"
+          echo "ANDROID_HOME=${SDK_ROOT}" >> "$GITHUB_ENV"
+          echo "ANDROID_SDK_ROOT=${SDK_ROOT}" >> "$GITHUB_ENV"
+          SDKMANAGER="${SDK_ROOT}/cmdline-tools/latest/bin/sdkmanager"
+          if [ ! -x "$SDKMANAGER" ]; then
+            SDKMANAGER="$(command -v sdkmanager)"
+          fi
+          yes | "$SDKMANAGER" --licenses >/dev/null || true
+          "$SDKMANAGER" "platform-tools" "platforms;android-35" "build-tools;35.0.0" "ndk;27.2.12479018"
+          echo "ANDROID_NDK_HOME=${SDK_ROOT}/ndk/27.2.12479018" >> "$GITHUB_ENV"
+          go install golang.org/x/mobile/cmd/gomobile@latest
+          go install golang.org/x/mobile/cmd/gobind@latest
+          GOPATH_BIN="$(go env GOPATH)/bin"
+          echo "${GOPATH_BIN}" >> "$GITHUB_PATH"
+          export PATH="${GOPATH_BIN}:${PATH}"
+          gomobile init
+
+      - name: Build Android AAR
+        env:
+          ANDROID_GO_TARGETS: android/arm64,android/amd64
+        run: ./packaging/build-android.sh aar
+
+      - name: Run Android unit tests and assemble debug APK
+        run: gradle -p android testDebugUnitTest assembleDebug
+
+      - name: Verify Android release R8 shrinking and APK packaging
+        env:
+          SKIP_AAR: "1"
+          DIST_DIR: ${{ runner.temp }}/android-ci-dist
+        run: ./packaging/build-android.sh release

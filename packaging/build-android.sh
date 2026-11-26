@@ -232,16 +232,28 @@ build_release() {
   stripped_b64="$(printf '%s' "${ANDROID_KEYSTORE_BASE64:-}" | tr -d ' \t\r\n')"
 
   if [[ -n "$stripped_b64" ]]; then
+    if [[ -z "${ANDROID_KEYSTORE_PASSWORD:-}" ]]; then
+      echo "Error: ANDROID_KEYSTORE_BASE64 is configured, but ANDROID_KEYSTORE_PASSWORD is empty." >&2
+      exit 1
+    fi
     printf '%s' "$stripped_b64" | base64 -d > "$sign_dir/release.keystore"
     export ANDROID_KEYSTORE_PATH="$sign_dir/release.keystore"
-    export ANDROID_KEYSTORE_PASSWORD="${ANDROID_KEYSTORE_PASSWORD:-}"
-    export ANDROID_KEY_ALIAS="${ANDROID_KEY_ALIAS:-}"
-    export ANDROID_KEY_PASSWORD="${ANDROID_KEY_PASSWORD:-}"
-  elif [[ -n "${ANDROID_KEYSTORE_PATH:-}" && -r "${ANDROID_KEYSTORE_PATH:-}" ]]; then
+    export ANDROID_KEYSTORE_PASSWORD
+    export ANDROID_KEY_ALIAS="${ANDROID_KEY_ALIAS:-tunssh}"
+    export ANDROID_KEY_PASSWORD="${ANDROID_KEY_PASSWORD:-$ANDROID_KEYSTORE_PASSWORD}"
+  elif [[ -n "${ANDROID_KEYSTORE_PATH:-}" ]]; then
+    if [[ ! -r "$ANDROID_KEYSTORE_PATH" ]]; then
+      echo "Error: ANDROID_KEYSTORE_PATH ('$ANDROID_KEYSTORE_PATH') does not exist or is not readable." >&2
+      exit 1
+    fi
+    if [[ -z "${ANDROID_KEYSTORE_PASSWORD:-}" ]]; then
+      echo "Error: ANDROID_KEYSTORE_PATH is configured, but ANDROID_KEYSTORE_PASSWORD is empty." >&2
+      exit 1
+    fi
     export ANDROID_KEYSTORE_PATH
-    export ANDROID_KEYSTORE_PASSWORD="${ANDROID_KEYSTORE_PASSWORD:-}"
-    export ANDROID_KEY_ALIAS="${ANDROID_KEY_ALIAS:-}"
-    export ANDROID_KEY_PASSWORD="${ANDROID_KEY_PASSWORD:-}"
+    export ANDROID_KEYSTORE_PASSWORD
+    export ANDROID_KEY_ALIAS="${ANDROID_KEY_ALIAS:-tunssh}"
+    export ANDROID_KEY_PASSWORD="${ANDROID_KEY_PASSWORD:-$ANDROID_KEYSTORE_PASSWORD}"
   else
     if ! command -v keytool >/dev/null 2>&1; then
       echo "Error: 'keytool' not found in PATH to generate an ephemeral release keystore." >&2
@@ -261,8 +273,8 @@ build_release() {
       -keyalg RSA \
       -keysize 2048 \
       -validity 365 \
-      -storepass "$ANDROID_KEYSTORE_PASSWORD" \
-      -keypass "$ANDROID_KEY_PASSWORD" \
+      -storepass:env ANDROID_KEYSTORE_PASSWORD \
+      -keypass:env ANDROID_KEY_PASSWORD \
       -dname "CN=tunssh, OU=Release, O=tunssh, L=Unknown, ST=Unknown, C=US" >/dev/null
   fi
 

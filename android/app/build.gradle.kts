@@ -19,15 +19,27 @@ val resolvedVersionCode = providers.gradleProperty("tunsshVersionCode")
     ?.takeIf { it > 0 }
     ?: 1
 
-val keystorePath = System.getenv("ANDROID_KEYSTORE_PATH")?.trim().orEmpty()
-val keystorePassword = System.getenv("ANDROID_KEYSTORE_PASSWORD").orEmpty()
-val keyAlias = System.getenv("ANDROID_KEY_ALIAS")?.trim().orEmpty()
-val keyPassword = System.getenv("ANDROID_KEY_PASSWORD").orEmpty()
+val releaseKeystorePath = providers.environmentVariable("ANDROID_KEYSTORE_PATH")
+    .orNull
+    ?.trim()
+    .orEmpty()
+val releaseStorePassword = providers.environmentVariable("ANDROID_KEYSTORE_PASSWORD")
+    .orNull
+    .orEmpty()
+val releaseKeyAlias = providers.environmentVariable("ANDROID_KEY_ALIAS")
+    .orNull
+    ?.trim()
+    .orEmpty()
+    .ifEmpty { "tunssh" }
+val releaseKeyPassword = providers.environmentVariable("ANDROID_KEY_PASSWORD")
+    .orNull
+    .orEmpty()
+    .ifEmpty { releaseStorePassword }
 val signingConfigured =
-    keystorePath.isNotEmpty() &&
-        keystorePassword.isNotEmpty() &&
-        keyAlias.isNotEmpty() &&
-        keyPassword.isNotEmpty()
+    releaseKeystorePath.isNotEmpty() &&
+        releaseStorePassword.isNotEmpty() &&
+        releaseKeyAlias.isNotEmpty() &&
+        releaseKeyPassword.isNotEmpty()
 
 android {
     namespace = "dev.tunssh.android"
@@ -46,10 +58,10 @@ android {
     if (signingConfigured) {
         signingConfigs {
             create("release") {
-                storeFile = File(keystorePath)
-                storePassword = keystorePassword
-                this.keyAlias = keyAlias
-                this.keyPassword = keyPassword
+                storeFile = File(releaseKeystorePath)
+                storePassword = releaseStorePassword
+                keyAlias = releaseKeyAlias
+                keyPassword = releaseKeyPassword
             }
         }
     }

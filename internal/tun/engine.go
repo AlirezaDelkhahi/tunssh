@@ -20,12 +20,19 @@ import (
 	"time"
 
 	"github.com/xjasonlyu/tun2socks/v2/core"
+	"github.com/xjasonlyu/tun2socks/v2/core/adapter"
 	"github.com/xjasonlyu/tun2socks/v2/core/device"
 	M "github.com/xjasonlyu/tun2socks/v2/metadata"
 	t2sproxy "github.com/xjasonlyu/tun2socks/v2/proxy"
 	"github.com/xjasonlyu/tun2socks/v2/tunnel"
 	"github.com/xjasonlyu/tun2socks/v2/tunnel/statistic"
+	"gvisor.dev/gvisor/pkg/tcpip"
+	"gvisor.dev/gvisor/pkg/tcpip/adapters/gonet"
+	"gvisor.dev/gvisor/pkg/tcpip/header"
 	"gvisor.dev/gvisor/pkg/tcpip/stack"
+	"gvisor.dev/gvisor/pkg/tcpip/transport/tcp"
+	"gvisor.dev/gvisor/pkg/tcpip/transport/udp"
+	"gvisor.dev/gvisor/pkg/waiter"
 )
 
 const (
@@ -50,15 +57,31 @@ const (
 	minTunnelMTU        = 68
 	maxTunnelMTU        = 65535
 	maxIfaceNamePreview = 64
+
+	defaultTCPWndSize    = 0
+	maxTCPConnAttempts   = 2 << 10
+	tcpKeepaliveCount    = 9
+	tcpKeepaliveIdle     = 60 * time.Second
+	tcpKeepaliveInterval = 30 * time.Second
 )
 
 // ErrUDPDropped is returned by CustomProxy.DialUDP for non-DNS UDP packets so
 // QUIC/UDP flows fast-fail and browsers cleanly fall back to TCP.
 var ErrUDPDropped = errors.New("tun: non-DNS UDP packet dropped")
 
+// ErrLocalTUNRejected is returned when non-DNS TCP traffic targets the local TUN subnet
+// (for example, Android Private DNS DoT probes to 198.18.0.2:853).
+var ErrLocalTUNRejected = errors.New("tun: non-DNS traffic to local TUN subnet rejected")
+
+// ErrIPv6Blocked is returned when BlockIPv6Data is enabled and a non-DNS IPv6 TCP
+// connection is attempted on an IPv4-only SSH tunnel.
+var ErrIPv6Blocked = errors.New("tun: IPv6 data connection blocked for IPv4-only tunnel")
+
 var (
-	_ t2sproxy.Proxy = (*CustomProxy)(nil)
-	_ TunRunner      = (*Runner)(nil)
+	_ t2sproxy.Proxy  = (*CustomProxy)(nil)
+	_ TunRunner       = (*Runner)(nil)
+	_ adapter.TCPConn = (*tunTCPConn)(nil)
+	_ adapter.UDPConn = (*tunUDPConn)(nil)
 )
 
 // Dialer establishes outbound TCP connections through the upstream SSH tunnel.
@@ -68,14 +91,15 @@ type Dialer interface {
 
 // Config configures the TUN interface, upstream dialer, and local DNS redirect targets.
 type Config struct {
-	IfaceName    string
-	MTU          int
-	IPv4CIDR     string
-	IPv6CIDR     string
-	EnableIPv6   bool
-	TunnelDialer Dialer
-	DNSUDPAddr   string
-	DNSTCPAddr   string
+	IfaceName     string
+	MTU           int
+	IPv4CIDR      string
+	IPv6CIDR      string
+	EnableIPv6    bool
+	BlockIPv6Data bool
+	TunnelDialer  Dialer
+	DNSUDPAddr    string
+	DNSTCPAddr    string
 }
 
 // Stats holds a thread-safe snapshot of TUN runner state and tunnel byte counters.
@@ -249,12 +273,48 @@ func normalizeRunnerConfig(cfg Config) (Config, error) {
 	return cfg, nil
 }
 
+func parseTUNPrefixes(cfg Config) (netip.Prefix, netip.Prefix) {
+	var v4, v6 netip.Prefix
+
+	rawV4 := strings.TrimSpace(cfg.IPv4CIDR)
+	if rawV4 == "" {
+		rawV4 = DefaultIPv4CIDR
+	}
+	if p4, err := netip.ParsePrefix(rawV4); err == nil && p4.IsValid() && p4.Addr().Is4() {
+		v4 = p4.Masked()
+	}
+
+	rawV6 := strings.TrimSpace(cfg.IPv6CIDR)
+	if rawV6 == "" && cfg.EnableIPv6 {
+		rawV6 = DefaultIPv6CIDR
+	}
+	if rawV6 != "" {
+		if p6, err := netip.ParsePrefix(rawV6); err == nil && p6.IsValid() && p6.Addr().Is6() {
+			v6 = p6.Masked()
+		}
+	}
+
+	return v4, v6
+}
+
+func isLocalTUNAddr(dstIP netip.Addr, v4, v6 netip.Prefix) bool {
+	if !dstIP.IsValid() {
+		return false
+	}
+	ip := dstIP.Unmap()
+	return (v4.IsValid() && v4.Contains(ip)) || (v6.IsValid() && v6.Contains(ip))
+}
+
 // CustomProxy implements tun2socks v2 proxy.Proxy by routing TCP traffic through TunnelDialer,
-// redirecting TCP/UDP :53 to local embedded DNS listeners, and fast-rejecting non-DNS UDP.
+// redirecting TCP/UDP :53 to local embedded DNS listeners, and fast-rejecting non-DNS UDP,
+// non-DNS local TUN subnet probes, and (optionally) IPv6 data connections.
 type CustomProxy struct {
-	tunnelDialer Dialer
-	dnsUDPAddr   string
-	dnsTCPAddr   string
+	tunnelDialer  Dialer
+	dnsUDPAddr    string
+	dnsTCPAddr    string
+	tunIPv4Prefix netip.Prefix
+	tunIPv6Prefix netip.Prefix
+	blockIPv6Data bool
 
 	baseCtx context.Context
 	cancel  context.CancelFunc
@@ -270,13 +330,17 @@ type CustomProxy struct {
 // NewCustomProxy constructs a CustomProxy for the given Config.
 func NewCustomProxy(cfg Config) *CustomProxy {
 	baseCtx, cancel := context.WithCancel(context.Background())
+	tunV4, tunV6 := parseTUNPrefixes(cfg)
 	return &CustomProxy{
-		tunnelDialer: cfg.TunnelDialer,
-		dnsUDPAddr:   cfg.DNSUDPAddr,
-		dnsTCPAddr:   cfg.DNSTCPAddr,
-		baseCtx:      baseCtx,
-		cancel:       cancel,
-		active:       make(map[io.Closer]struct{}),
+		tunnelDialer:  cfg.TunnelDialer,
+		dnsUDPAddr:    cfg.DNSUDPAddr,
+		dnsTCPAddr:    cfg.DNSTCPAddr,
+		tunIPv4Prefix: tunV4,
+		tunIPv6Prefix: tunV6,
+		blockIPv6Data: cfg.BlockIPv6Data,
+		baseCtx:       baseCtx,
+		cancel:        cancel,
+		active:        make(map[io.Closer]struct{}),
 	}
 }
 
@@ -356,6 +420,16 @@ func (p *CustomProxy) DialContext(ctx context.Context, md *M.Metadata) (net.Conn
 	}
 	if p.isClosed() {
 		return nil, net.ErrClosed
+	}
+
+	if md.DstPort != DefaultDNSPort && md.DstIP.IsValid() {
+		dstIP := md.DstIP.Unmap()
+		if isLocalTUNAddr(dstIP, p.tunIPv4Prefix, p.tunIPv6Prefix) {
+			return nil, ErrLocalTUNRejected
+		}
+		if p.blockIPv6Data && dstIP.Is6() {
+			return nil, ErrIPv6Blocked
+		}
 	}
 
 	dialCtx, dialCancel := context.WithCancel(ctx)
@@ -547,15 +621,64 @@ type postWaitCloser interface {
 
 // onceCloseDevice guards device.Device.Close() with sync.Once because both Runner.Stop
 // and gVisor stack.Wait (via removeNICLocked) invoke Close() during teardown; double-closing
-// an OS TUN file descriptor would introduce an fd-reuse race.
+// an OS TUN file descriptor would introduce an fd-reuse race. It also supports deferring
+// LinkEndpoint.Attach until custom gVisor transport handlers are installed so inbound packet
+// dispatch never races with SetTransportProtocolHandler.
 type onceCloseDevice struct {
 	device.Device
 	closeOnce  sync.Once
 	beforeOnce sync.Once
 	afterOnce  sync.Once
+
+	attachMu        sync.Mutex
+	deferAttach     bool
+	attachClosed    bool
+	pendingDispatch stack.NetworkDispatcher
+}
+
+func (d *onceCloseDevice) Attach(dispatcher stack.NetworkDispatcher) {
+	d.attachMu.Lock()
+	if dispatcher == nil {
+		d.attachClosed = true
+		d.pendingDispatch = nil
+		d.attachMu.Unlock()
+		d.Device.Attach(nil)
+		return
+	}
+	if d.attachClosed {
+		d.attachMu.Unlock()
+		return
+	}
+	if d.deferAttach {
+		d.pendingDispatch = dispatcher
+		d.attachMu.Unlock()
+		return
+	}
+	d.attachMu.Unlock()
+	d.Device.Attach(dispatcher)
+}
+
+func (d *onceCloseDevice) ActivateAttach() {
+	d.attachMu.Lock()
+	d.deferAttach = false
+	disp := d.pendingDispatch
+	d.pendingDispatch = nil
+	closed := d.attachClosed
+	d.attachMu.Unlock()
+	if !closed && disp != nil {
+		d.Device.Attach(disp)
+	}
+}
+
+func (d *onceCloseDevice) markAttachClosed() {
+	d.attachMu.Lock()
+	d.attachClosed = true
+	d.pendingDispatch = nil
+	d.attachMu.Unlock()
 }
 
 func (d *onceCloseDevice) Close() {
+	d.markAttachClosed()
 	d.closeOnce.Do(func() {
 		if pwc, ok := d.Device.(postWaitCloser); ok {
 			pwc.CloseBeforeWait()
@@ -567,6 +690,7 @@ func (d *onceCloseDevice) Close() {
 }
 
 func (d *onceCloseDevice) CloseBeforeWait() {
+	d.markAttachClosed()
 	d.beforeOnce.Do(func() {
 		if pwc, ok := d.Device.(postWaitCloser); ok {
 			pwc.CloseBeforeWait()
@@ -583,6 +707,113 @@ func (d *onceCloseDevice) CloseAfterWait() {
 			return
 		}
 		d.Close()
+	})
+}
+
+type tunTCPConn struct {
+	*gonet.TCPConn
+	id stack.TransportEndpointID
+}
+
+func (c *tunTCPConn) ID() stack.TransportEndpointID {
+	return c.id
+}
+
+type tunUDPConn struct {
+	*gonet.UDPConn
+	id stack.TransportEndpointID
+}
+
+func (c *tunUDPConn) ID() stack.TransportEndpointID {
+	return c.id
+}
+
+func setTCPSocketOptions(s *stack.Stack, ep tcpip.Endpoint) tcpip.Error {
+	ep.SocketOptions().SetKeepAlive(true)
+
+	idle := tcpip.KeepaliveIdleOption(tcpKeepaliveIdle)
+	if err := ep.SetSockOpt(&idle); err != nil {
+		return err
+	}
+
+	interval := tcpip.KeepaliveIntervalOption(tcpKeepaliveInterval)
+	if err := ep.SetSockOpt(&interval); err != nil {
+		return err
+	}
+
+	if err := ep.SetSockOptInt(tcpip.KeepaliveCountOption, tcpKeepaliveCount); err != nil {
+		return err
+	}
+
+	var ss tcpip.TCPSendBufferSizeRangeOption
+	if err := s.TransportProtocolOption(header.TCPProtocolNumber, &ss); err == nil {
+		ep.SocketOptions().SetSendBufferSize(int64(ss.Default), false)
+	}
+
+	var rs tcpip.TCPReceiveBufferSizeRangeOption
+	if err := s.TransportProtocolOption(header.TCPProtocolNumber, &rs); err == nil {
+		ep.SocketOptions().SetReceiveBufferSize(int64(rs.Default), false)
+	}
+	return nil
+}
+
+// installFastRejectHandlers installs custom gVisor TCP and UDP transport forwarders that:
+//   - immediately TCP-RST non-DNS traffic targeting the local TUN IPv4/IPv6 subnet (e.g., Android Private DNS :853),
+//   - immediately TCP-RST non-DNS IPv6 traffic when cfg.BlockIPv6Data is enabled (fast Happy Eyeballs fallback), and
+//   - immediately reject non-DNS UDP packets (e.g., QUIC :443) before creating a gVisor UDP endpoint.
+func installFastRejectHandlers(st *stack.Stack, handler adapter.TransportHandler, cfg Config) {
+	tunIPv4Prefix, tunIPv6Prefix := parseTUNPrefixes(cfg)
+
+	tcpFwd := tcp.NewForwarder(st, defaultTCPWndSize, maxTCPConnAttempts, func(r *tcp.ForwarderRequest) {
+		id := r.ID()
+		if id.LocalPort != DefaultDNSPort {
+			if dstIP, ok := netip.AddrFromSlice(id.LocalAddress.AsSlice()); ok && dstIP.IsValid() {
+				ip := dstIP.Unmap()
+				if isLocalTUNAddr(ip, tunIPv4Prefix, tunIPv6Prefix) || (cfg.BlockIPv6Data && ip.Is6()) {
+					r.Complete(true)
+					return
+				}
+			}
+		}
+
+		var wq waiter.Queue
+		ep, err := r.CreateEndpoint(&wq)
+		if err != nil {
+			r.Complete(true)
+			return
+		}
+		defer r.Complete(false)
+
+		_ = setTCPSocketOptions(st, ep)
+
+		handler.HandleTCP(&tunTCPConn{
+			TCPConn: gonet.NewTCPConn(&wq, ep),
+			id:      id,
+		})
+	})
+	st.SetTransportProtocolHandler(tcp.ProtocolNumber, tcpFwd.HandlePacket)
+
+	udpFwd := udp.NewForwarder(st, func(r *udp.ForwarderRequest) bool {
+		id := r.ID()
+		if id.LocalPort != DefaultDNSPort {
+			return false
+		}
+		var wq waiter.Queue
+		ep, err := r.CreateEndpoint(&wq)
+		if err != nil {
+			return false
+		}
+		handler.HandleUDP(&tunUDPConn{
+			UDPConn: gonet.NewUDPConn(&wq, ep),
+			id:      id,
+		})
+		return true
+	})
+	st.SetTransportProtocolHandler(udp.ProtocolNumber, func(id stack.TransportEndpointID, pkt *stack.PacketBuffer) bool {
+		if id.LocalPort != DefaultDNSPort {
+			return false
+		}
+		return udpFwd.HandlePacket(id, pkt)
 	})
 }
 
@@ -710,7 +941,8 @@ func (r *Runner) Start(ctx context.Context, cfg Config) (int, error) {
 	if err != nil {
 		return 0, err
 	}
-	wrappedDev = &onceCloseDevice{Device: rawDev}
+	ocd := &onceCloseDevice{Device: rawDev, deferAttach: true}
+	wrappedDev = ocd
 
 	if err := ctx.Err(); err != nil {
 		return 0, err
@@ -727,10 +959,12 @@ func (r *Runner) Start(ctx context.Context, cfg Config) (int, error) {
 	if err != nil {
 		return 0, fmt.Errorf("tun: create gVisor stack: %w", err)
 	}
+	installFastRejectHandlers(st, tunInst, normCfg)
 
 	if err := ctx.Err(); err != nil {
 		return 0, err
 	}
+	ocd.ActivateAttach()
 
 	ifaceName := rawDev.Name()
 	if ifaceName == "" {

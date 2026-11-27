@@ -733,3 +733,380 @@ func TestRunner_ConcurrentStopIsIdempotent(t *testing.T) {
 		}
 	}
 }
+
+func TestCustomProxy_DialContext_RejectsLocalTUNNonDNS(t *testing.T) {
+	dnsAddr, stopDNS := startTCPEchoServer(t)
+	defer stopDNS()
+
+	dialer := &mockDialer{}
+	p := NewCustomProxy(Config{
+		IPv4CIDR:     DefaultIPv4CIDR,
+		IPv6CIDR:     DefaultIPv6CIDR,
+		EnableIPv6:   true,
+		TunnelDialer: dialer,
+		DNSTCPAddr:   dnsAddr,
+	})
+	defer p.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+
+	// 1. 198.18.0.2:853 (Android Private DNS DoT probe) must be rejected immediately without dialing SSH.
+	if conn, err := p.DialContext(ctx, &M.Metadata{
+		Network: M.TCP,
+		SrcIP:   netip.MustParseAddr("198.18.0.1"),
+		SrcPort: 50001,
+		DstIP:   netip.MustParseAddr("198.18.0.2"),
+		DstPort: 853,
+	}); !errors.Is(err, ErrLocalTUNRejected) {
+		if conn != nil {
+			_ = conn.Close()
+		}
+		t.Fatalf("198.18.0.2:853 err = %v, want ErrLocalTUNRejected", err)
+	}
+
+	// 2. fd98:18::2:853 (IPv6 TUN subnet non-DNS) must also be rejected immediately.
+	if conn, err := p.DialContext(ctx, &M.Metadata{
+		Network: M.TCP,
+		SrcIP:   netip.MustParseAddr("fd98:18::1"),
+		SrcPort: 50002,
+		DstIP:   netip.MustParseAddr("fd98:18::2"),
+		DstPort: 853,
+	}); !errors.Is(err, ErrLocalTUNRejected) {
+		if conn != nil {
+			_ = conn.Close()
+		}
+		t.Fatalf("fd98:18::2:853 err = %v, want ErrLocalTUNRejected", err)
+	}
+
+	if calls := dialer.Calls(); len(calls) != 0 {
+		t.Fatalf("expected 0 TunnelDialer calls for rejected local TUN destinations, got %+v", calls)
+	}
+
+	// 3. 198.18.0.2:53 must still route to the local DNS TCP listener.
+	conn, err := p.DialContext(ctx, &M.Metadata{
+		Network: M.TCP,
+		SrcIP:   netip.MustParseAddr("198.18.0.1"),
+		SrcPort: 50003,
+		DstIP:   netip.MustParseAddr("198.18.0.2"),
+		DstPort: 53,
+	})
+	if err != nil {
+		t.Fatalf("198.18.0.2:53 failed: %v", err)
+	}
+	_ = conn.Close()
+	if calls := dialer.Calls(); len(calls) != 0 {
+		t.Fatalf("expected 0 TunnelDialer calls for TCP:53, got %+v", calls)
+	}
+}
+
+func TestCustomProxy_DialContext_BlockIPv6Data(t *testing.T) {
+	echoAddr, stopEcho := startTCPEchoServer(t)
+	defer stopEcho()
+
+	dialer := &mockDialer{
+		fn: func(ctx context.Context, network, address string) (net.Conn, error) {
+			return (&net.Dialer{}).DialContext(ctx, network, echoAddr)
+		},
+	}
+
+	p := NewCustomProxy(Config{
+		IPv4CIDR:      DefaultIPv4CIDR,
+		IPv6CIDR:      DefaultIPv6CIDR,
+		EnableIPv6:    true,
+		BlockIPv6Data: true,
+		TunnelDialer:  dialer,
+	})
+	defer p.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+
+	// IPv6 data connection must be rejected immediately without calling TunnelDialer.
+	if conn, err := p.DialContext(ctx, &M.Metadata{
+		Network: M.TCP,
+		SrcIP:   netip.MustParseAddr("fd98:18::1"),
+		SrcPort: 51000,
+		DstIP:   netip.MustParseAddr("2606:4700:4700::1111"),
+		DstPort: 443,
+	}); !errors.Is(err, ErrIPv6Blocked) {
+		if conn != nil {
+			_ = conn.Close()
+		}
+		t.Fatalf("[2606:4700:4700::1111]:443 err = %v, want ErrIPv6Blocked", err)
+	}
+	if calls := dialer.Calls(); len(calls) != 0 {
+		t.Fatalf("expected 0 TunnelDialer calls when IPv6 blocked, got %+v", calls)
+	}
+
+	// IPv4 data connection must still dial TunnelDialer normally.
+	conn, err := p.DialContext(ctx, &M.Metadata{
+		Network: M.TCP,
+		SrcIP:   netip.MustParseAddr("198.18.0.1"),
+		SrcPort: 51001,
+		DstIP:   netip.MustParseAddr("1.1.1.1"),
+		DstPort: 443,
+	})
+	if err != nil {
+		t.Fatalf("1.1.1.1:443 failed: %v", err)
+	}
+	_ = conn.Close()
+
+	calls := dialer.Calls()
+	if len(calls) != 1 || calls[0].address != "1.1.1.1:443" {
+		t.Fatalf("unexpected TunnelDialer calls: %+v", calls)
+	}
+
+	// Zero-value default (BlockIPv6Data: false) preserves IPv6 forwarding.
+	pAllowV6 := NewCustomProxy(Config{
+		TunnelDialer: dialer,
+	})
+	defer pAllowV6.Close()
+	c2, err := pAllowV6.DialContext(ctx, &M.Metadata{
+		Network: M.TCP,
+		DstIP:   netip.MustParseAddr("2606:4700:4700::1111"),
+		DstPort: 443,
+	})
+	if err != nil {
+		t.Fatalf("IPv6 with BlockIPv6Data=false failed: %v", err)
+	}
+	_ = c2.Close()
+	if calls := dialer.Calls(); len(calls) != 2 || calls[1].address != "[2606:4700:4700::1111]:443" {
+		t.Fatalf("expected IPv6 dial when BlockIPv6Data=false, got %+v", calls)
+	}
+}
+
+func buildIPv4TCPSynPacket(srcIP, dstIP netip.Addr, srcPort, dstPort uint16, seq uint32) []byte {
+	totalLen := header.IPv4MinimumSize + header.TCPMinimumSize
+	pkt := make([]byte, totalLen)
+
+	srcAddr := tcpip.AddrFrom4(srcIP.As4())
+	dstAddr := tcpip.AddrFrom4(dstIP.As4())
+
+	ipHdr := header.IPv4(pkt[:header.IPv4MinimumSize])
+	ipHdr.Encode(&header.IPv4Fields{
+		TotalLength: uint16(totalLen),
+		TTL:         64,
+		Protocol:    uint8(header.TCPProtocolNumber),
+		SrcAddr:     srcAddr,
+		DstAddr:     dstAddr,
+	})
+	ipHdr.SetChecksum(^ipHdr.CalculateChecksum())
+
+	tcpHdr := header.TCP(pkt[header.IPv4MinimumSize:])
+	tcpHdr.Encode(&header.TCPFields{
+		SrcPort:    srcPort,
+		DstPort:    dstPort,
+		SeqNum:     seq,
+		DataOffset: header.TCPMinimumSize,
+		Flags:      header.TCPFlagSyn,
+		WindowSize: 65535,
+	})
+	xsum := header.PseudoHeaderChecksum(header.TCPProtocolNumber, srcAddr, dstAddr, header.TCPMinimumSize)
+	tcpHdr.SetChecksum(^tcpHdr.CalculateChecksum(xsum))
+	return pkt
+}
+
+func buildIPv6TCPSynPacket(srcIP, dstIP netip.Addr, srcPort, dstPort uint16, seq uint32) []byte {
+	totalLen := header.IPv6MinimumSize + header.TCPMinimumSize
+	pkt := make([]byte, totalLen)
+
+	srcAddr := tcpip.AddrFrom16(srcIP.As16())
+	dstAddr := tcpip.AddrFrom16(dstIP.As16())
+
+	ipHdr := header.IPv6(pkt[:header.IPv6MinimumSize])
+	ipHdr.Encode(&header.IPv6Fields{
+		PayloadLength:     header.TCPMinimumSize,
+		TransportProtocol: header.TCPProtocolNumber,
+		HopLimit:          64,
+		SrcAddr:           srcAddr,
+		DstAddr:           dstAddr,
+	})
+
+	tcpHdr := header.TCP(pkt[header.IPv6MinimumSize:])
+	tcpHdr.Encode(&header.TCPFields{
+		SrcPort:    srcPort,
+		DstPort:    dstPort,
+		SeqNum:     seq,
+		DataOffset: header.TCPMinimumSize,
+		Flags:      header.TCPFlagSyn,
+		WindowSize: 65535,
+	})
+	xsum := header.PseudoHeaderChecksum(header.TCPProtocolNumber, srcAddr, dstAddr, header.TCPMinimumSize)
+	tcpHdr.SetChecksum(^tcpHdr.CalculateChecksum(xsum))
+	return pkt
+}
+
+func TestRunner_FastRejectHandlers_TCPResetAndUDPDrop(t *testing.T) {
+	wantDNSReply := []byte("dns-ok-with-fast-reject")
+	dnsUDPAddr, dnsReceivedCh, stopDNS := startUDPDNSResponder(t, wantDNSReply)
+	defer stopDNS()
+
+	mockDev := newMockChannelDevice("tunssh-fast0", 1380)
+	dialer := &mockDialer{}
+
+	runner := newRunnerWithOpener(func(name string, mtu int, ipv4CIDR, ipv6CIDR string, enableIPv6 bool) (device.Device, int, error) {
+		return mockDev, 43, nil
+	})
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	if _, err := runner.Start(ctx, Config{
+		IfaceName:     "tunssh-fast0",
+		MTU:           1380,
+		IPv4CIDR:      DefaultIPv4CIDR,
+		IPv6CIDR:      DefaultIPv6CIDR,
+		EnableIPv6:    true,
+		BlockIPv6Data: true,
+		TunnelDialer:  dialer,
+		DNSUDPAddr:    dnsUDPAddr,
+	}); err != nil {
+		t.Fatalf("Runner.Start failed: %v", err)
+	}
+	defer func() {
+		stopCtx, stopCancel := context.WithTimeout(context.Background(), 3*time.Second)
+		defer stopCancel()
+		if err := runner.Stop(stopCtx); err != nil {
+			t.Errorf("Runner.Stop failed: %v", err)
+		}
+	}()
+
+	// 1. TCP SYN to 198.18.0.2:853 (Android Private DNS DoT) must get immediate TCP RST before CreateEndpoint.
+	syn853 := buildIPv4TCPSynPacket(
+		netip.MustParseAddr("198.18.0.1"),
+		netip.MustParseAddr("198.18.0.2"),
+		54321,
+		853,
+		1000,
+	)
+	pkt853 := stack.NewPacketBuffer(stack.PacketBufferOptions{Payload: buffer.MakeWithData(syn853)})
+	mockDev.InjectInbound(header.IPv4ProtocolNumber, pkt853)
+	pkt853.DecRef()
+
+	readCtx1, readCancel1 := context.WithTimeout(context.Background(), 2*time.Second)
+	defer readCancel1()
+	rstPkt1 := mockDev.ReadContext(readCtx1)
+	if rstPkt1 == nil {
+		t.Fatal("expected immediate TCP RST for 198.18.0.2:853, got nil")
+	}
+	rstBytes1 := rstPkt1.ToView().AsSlice()
+	rstPkt1.DecRef()
+	ipOut1 := header.IPv4(rstBytes1)
+	tcpOut1 := header.TCP(ipOut1.Payload())
+	if !tcpOut1.Flags().Contains(header.TCPFlagRst) {
+		t.Fatalf("198.18.0.2:853 reply flags = %v, want RST", tcpOut1.Flags())
+	}
+	if tcpOut1.SourcePort() != 853 || tcpOut1.DestinationPort() != 54321 {
+		t.Fatalf("198.18.0.2:853 RST ports = %d->%d, want 853->54321", tcpOut1.SourcePort(), tcpOut1.DestinationPort())
+	}
+
+	// 2. IPv6 TCP SYN to [2606:4700:4700::1111]:443 with BlockIPv6Data=true must get immediate TCP RST.
+	synV6 := buildIPv6TCPSynPacket(
+		netip.MustParseAddr("fd98:18::1"),
+		netip.MustParseAddr("2606:4700:4700::1111"),
+		54322,
+		443,
+		2000,
+	)
+	pktV6 := stack.NewPacketBuffer(stack.PacketBufferOptions{Payload: buffer.MakeWithData(synV6)})
+	mockDev.InjectInbound(header.IPv6ProtocolNumber, pktV6)
+	pktV6.DecRef()
+
+	readCtx2, readCancel2 := context.WithTimeout(context.Background(), 2*time.Second)
+	defer readCancel2()
+	rstPkt2 := mockDev.ReadContext(readCtx2)
+	if rstPkt2 == nil {
+		t.Fatal("expected immediate IPv6 TCP RST for [2606:4700:4700::1111]:443, got nil")
+	}
+	rstBytes2 := rstPkt2.ToView().AsSlice()
+	rstPkt2.DecRef()
+	ipOut2 := header.IPv6(rstBytes2)
+	tcpOut2 := header.TCP(ipOut2.Payload())
+	if !tcpOut2.Flags().Contains(header.TCPFlagRst) {
+		t.Fatalf("IPv6 :443 reply flags = %v, want RST", tcpOut2.Flags())
+	}
+	if tcpOut2.SourcePort() != 443 || tcpOut2.DestinationPort() != 54322 {
+		t.Fatalf("IPv6 :443 RST ports = %d->%d, want 443->54322", tcpOut2.SourcePort(), tcpOut2.DestinationPort())
+	}
+
+	// 3. Non-DNS UDP (QUIC :443) must be rejected at gVisor forwarder without touching DNS or TunnelDialer.
+	quicPkt := buildIPv4UDPPacket(
+		netip.MustParseAddr("198.18.0.1"),
+		netip.MustParseAddr("1.1.1.1"),
+		54323,
+		443,
+		[]byte("quic-client-hello"),
+	)
+	pktQUIC := stack.NewPacketBuffer(stack.PacketBufferOptions{Payload: buffer.MakeWithData(quicPkt)})
+	mockDev.InjectInbound(header.IPv4ProtocolNumber, pktQUIC)
+	pktQUIC.DecRef()
+
+	// Drain any ICMP port unreachable packet emitted by gVisor for unhandled UDP :443, then verify UDP :53 still works.
+	drainCtx, drainCancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	if p := mockDev.ReadContext(drainCtx); p != nil {
+		p.DecRef()
+	}
+	drainCancel()
+
+	dnsQuery := buildIPv4UDPPacket(
+		netip.MustParseAddr("198.18.0.1"),
+		netip.MustParseAddr("198.18.0.2"),
+		54324,
+		53,
+		[]byte("dns-after-quic"),
+	)
+	pktDNS := stack.NewPacketBuffer(stack.PacketBufferOptions{Payload: buffer.MakeWithData(dnsQuery)})
+	mockDev.InjectInbound(header.IPv4ProtocolNumber, pktDNS)
+	pktDNS.DecRef()
+
+	select {
+	case got := <-dnsReceivedCh:
+		if string(got) != "dns-after-quic" {
+			t.Fatalf("DNS listener got %q, want %q", got, "dns-after-quic")
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for UDP :53 DNS packet after QUIC rejection")
+	}
+
+	if calls := dialer.Calls(); len(calls) != 0 {
+		t.Fatalf("expected 0 TunnelDialer calls across all fast-rejected packets, got %+v", calls)
+	}
+
+	// 4. Normal IPv4 TCP SYN to a public address (93.184.216.34:443) must complete handshake (SYN+ACK)
+	// through our custom TCP forwarder and invoke TunnelDialer.
+	synOK := buildIPv4TCPSynPacket(
+		netip.MustParseAddr("198.18.0.1"),
+		netip.MustParseAddr("93.184.216.34"),
+		54325,
+		443,
+		3000,
+	)
+	pktOK := stack.NewPacketBuffer(stack.PacketBufferOptions{Payload: buffer.MakeWithData(synOK)})
+	mockDev.InjectInbound(header.IPv4ProtocolNumber, pktOK)
+	pktOK.DecRef()
+
+	readCtx3, readCancel3 := context.WithTimeout(context.Background(), 2*time.Second)
+	defer readCancel3()
+	gotSynAck := false
+	for !gotSynAck {
+		p := mockDev.ReadContext(readCtx3)
+		if p == nil {
+			t.Fatal("timed out waiting for TCP SYN+ACK from custom TCP forwarder for 93.184.216.34:443")
+		}
+		b := p.ToView().AsSlice()
+		p.DecRef()
+		if len(b) < header.IPv4MinimumSize {
+			continue
+		}
+		ipOut := header.IPv4(b)
+		if ipOut.TransportProtocol() != header.TCPProtocolNumber {
+			continue
+		}
+		tcpOut := header.TCP(ipOut.Payload())
+		if tcpOut.SourcePort() == 443 && tcpOut.DestinationPort() == 54325 &&
+			tcpOut.Flags().Contains(header.TCPFlagSyn|header.TCPFlagAck) {
+			gotSynAck = true
+		}
+	}
+}

@@ -1358,3 +1358,167 @@ func TestUpdateBypassUpstreams(t *testing.T) {
 		t.Fatalf("third Exchange IP = %s, want 198.51.100.200", ip)
 	}
 }
+
+func TestServerSuppressAAAAAndHTTPS(t *testing.T) {
+	makeAAAAReply := func(req *mdns.Msg, ip string, ttl uint32) *mdns.Msg {
+		resp := new(mdns.Msg)
+		resp.SetReply(req)
+		resp.RecursionAvailable = true
+		if len(req.Question) > 0 {
+			resp.Answer = []mdns.RR{
+				&mdns.AAAA{
+					Hdr: mdns.RR_Header{
+						Name:   req.Question[0].Name,
+						Rrtype: mdns.TypeAAAA,
+						Class:  mdns.ClassINET,
+						Ttl:    ttl,
+					},
+					AAAA: net.ParseIP(ip).To16(),
+				},
+			}
+		}
+		return resp
+	}
+
+	t.Run("SuppressAAAA true returns NODATA for AAAA and HTTPS without dialing upstream while A resolves", func(t *testing.T) {
+		tunnelDialer := &mockDialer{
+			fn: func(_ context.Context, _, _ string) (net.Conn, error) {
+				return serveTCPPipe(func(req *mdns.Msg) *mdns.Msg {
+					if req.Question[0].Qtype == mdns.TypeA {
+						return makeAReply(req, "35.186.224.25", 60)
+					}
+					return makeAAAAReply(req, "2606:4700:4700::1111", 60)
+				}), nil
+			},
+		}
+		bypassDialer := &mockDialer{
+			fn: func(_ context.Context, _, _ string) (net.Conn, error) {
+				return serveUDPPipe(func(req *mdns.Msg) *mdns.Msg {
+					return makeAAAAReply(req, "2001:db8::1", 60)
+				}), nil
+			},
+		}
+
+		srv := NewServer()
+		err := srv.Start(context.Background(), DNSConfig{
+			ListenAddr:      "127.0.0.1:0",
+			TunnelDialer:    tunnelDialer,
+			BypassDialer:    bypassDialer,
+			BypassUpstreams: []string{"192.0.2.1:53"},
+			BypassIranLAN:   true,
+			SuppressAAAA:    true,
+		})
+		if err != nil {
+			t.Fatalf("Start() error = %v", err)
+		}
+		defer srv.Stop(context.Background())
+
+		// 1. AAAA query over Exchange -> immediate empty NOERROR NODATA.
+		reqAAAA := new(mdns.Msg)
+		reqAAAA.SetQuestion("open.spotify.com.", mdns.TypeAAAA)
+		respAAAA, err := srv.Exchange(context.Background(), reqAAAA)
+		if err != nil {
+			t.Fatalf("Exchange(AAAA) error = %v", err)
+		}
+		if respAAAA.Rcode != mdns.RcodeSuccess {
+			t.Fatalf("AAAA Rcode = %s, want NOERROR", mdns.RcodeToString[respAAAA.Rcode])
+		}
+		if len(respAAAA.Answer) != 0 {
+			t.Fatalf("AAAA Answer len = %d, want 0", len(respAAAA.Answer))
+		}
+		if !respAAAA.RecursionAvailable {
+			t.Fatal("expected RecursionAvailable=true on suppressed AAAA reply")
+		}
+
+		// 2. HTTPS (Type 65) query over UDP wire client -> immediate empty NOERROR NODATA.
+		udpClient := &mdns.Client{Net: "udp", Timeout: 2 * time.Second}
+		reqHTTPS := new(mdns.Msg)
+		reqHTTPS.SetQuestion("www.youtube.com.", mdns.TypeHTTPS)
+		respHTTPS, _, err := udpClient.Exchange(reqHTTPS, srv.UDPAddr())
+		if err != nil {
+			t.Fatalf("UDP Exchange(HTTPS) error = %v", err)
+		}
+		if respHTTPS.Rcode != mdns.RcodeSuccess {
+			t.Fatalf("HTTPS Rcode = %s, want NOERROR", mdns.RcodeToString[respHTTPS.Rcode])
+		}
+		if len(respHTTPS.Answer) != 0 {
+			t.Fatalf("HTTPS Answer len = %d, want 0", len(respHTTPS.Answer))
+		}
+
+		// 3. Bypass .ir domain AAAA query is also suppressed without dialing bypass upstream.
+		reqIRAAAA := new(mdns.Msg)
+		reqIRAAAA.SetQuestion("bankmellat.ir.", mdns.TypeAAAA)
+		respIRAAAA, err := srv.Exchange(context.Background(), reqIRAAAA)
+		if err != nil {
+			t.Fatalf("Exchange(.ir AAAA) error = %v", err)
+		}
+		if respIRAAAA.Rcode != mdns.RcodeSuccess || len(respIRAAAA.Answer) != 0 {
+			t.Fatalf("expected empty NOERROR for .ir AAAA, got rcode=%s answers=%d", mdns.RcodeToString[respIRAAAA.Rcode], len(respIRAAAA.Answer))
+		}
+
+		if got := tunnelDialer.CallCount(); got != 0 {
+			t.Fatalf("TunnelDialer calls after suppressed AAAA/HTTPS = %d, want 0", got)
+		}
+		if got := bypassDialer.CallCount(); got != 0 {
+			t.Fatalf("BypassDialer calls after suppressed .ir AAAA = %d, want 0", got)
+		}
+		stats := srv.Stats()
+		if stats.TotalQueries != 3 {
+			t.Fatalf("TotalQueries = %d, want 3", stats.TotalQueries)
+		}
+		if stats.CacheEntries != 0 {
+			t.Fatalf("CacheEntries = %d, want 0 (suppressed replies must not be cached)", stats.CacheEntries)
+		}
+
+		// 4. Regular A query resolves normally through TunnelDialer.
+		reqA := new(mdns.Msg)
+		reqA.SetQuestion("open.spotify.com.", mdns.TypeA)
+		respA, err := srv.Exchange(context.Background(), reqA)
+		if err != nil {
+			t.Fatalf("Exchange(A) error = %v", err)
+		}
+		if ip, _ := extractFirstA(t, respA); ip != "35.186.224.25" {
+			t.Fatalf("A answer IP = %s, want 35.186.224.25", ip)
+		}
+		if got := tunnelDialer.CallCount(); got != 1 {
+			t.Fatalf("TunnelDialer calls after A query = %d, want 1", got)
+		}
+	})
+
+	t.Run("SuppressAAAA false forwards AAAA normally to upstream", func(t *testing.T) {
+		tunnelDialer := &mockDialer{
+			fn: func(_ context.Context, _, _ string) (net.Conn, error) {
+				return serveTCPPipe(func(req *mdns.Msg) *mdns.Msg {
+					return makeAAAAReply(req, "2606:4700:4700::1111", 60)
+				}), nil
+			},
+		}
+
+		srv := NewServer()
+		err := srv.Start(context.Background(), DNSConfig{
+			ListenAddr:   "127.0.0.1:0",
+			TunnelDialer: tunnelDialer,
+		})
+		if err != nil {
+			t.Fatalf("Start() error = %v", err)
+		}
+		defer srv.Stop(context.Background())
+
+		req := new(mdns.Msg)
+		req.SetQuestion("ipv6.example.", mdns.TypeAAAA)
+		resp, err := srv.Exchange(context.Background(), req)
+		if err != nil {
+			t.Fatalf("Exchange(AAAA) error = %v", err)
+		}
+		if resp.Rcode != mdns.RcodeSuccess || len(resp.Answer) != 1 {
+			t.Fatalf("expected 1 AAAA answer, got rcode=%s answers=%d", mdns.RcodeToString[resp.Rcode], len(resp.Answer))
+		}
+		aaaa, ok := resp.Answer[0].(*mdns.AAAA)
+		if !ok || aaaa.AAAA.String() != "2606:4700:4700::1111" {
+			t.Fatalf("unexpected AAAA answer: %#v", resp.Answer[0])
+		}
+		if got := tunnelDialer.CallCount(); got != 1 {
+			t.Fatalf("TunnelDialer calls = %d, want 1", got)
+		}
+	})
+}

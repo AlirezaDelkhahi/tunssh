@@ -38,6 +38,7 @@ type DNSConfig struct {
 	TunnelUpstreams []string
 	BypassUpstreams []string
 	BypassIranLAN   bool
+	SuppressAAAA    bool
 	QueryTimeout    time.Duration
 	CacheMaxEntries int
 	Transport       string
@@ -312,6 +313,7 @@ type Server struct {
 	wg           sync.WaitGroup
 
 	bypassIranLAN  atomic.Bool
+	suppressAAAA   atomic.Bool
 	totalQueries   atomic.Uint64
 	tunnelQueries  atomic.Uint64
 	bypassQueries  atomic.Uint64
@@ -458,6 +460,7 @@ func (s *Server) Start(ctx context.Context, cfg DNSConfig) error {
 
 	s.mu.Lock()
 	s.bypassIranLAN.Store(cfg.BypassIranLAN)
+	s.suppressAAAA.Store(cfg.SuppressAAAA)
 	s.udpServer = udpSrv
 	s.tcpServer = tcpSrv
 	s.udpAddr = pc.LocalAddr().String()
@@ -771,6 +774,10 @@ func (s *Server) Exchange(ctx context.Context, req *dns.Msg) (*dns.Msg, error) {
 	s.mu.Unlock()
 
 	q := req.Question[0]
+	if s.suppressAAAA.Load() && (q.Qtype == dns.TypeAAAA || q.Qtype == dns.TypeHTTPS) {
+		return rcodeReply(req, dns.RcodeSuccess), nil
+	}
+
 	bypass := ShouldBypassDomain(q.Name, s.bypassIranLAN.Load())
 	namespace := namespaceTunnel
 	fwd := tunnelFwd

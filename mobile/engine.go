@@ -266,6 +266,7 @@ func (e *Engine) AttachTun(tunFD int32) error {
 		BypassDialer:    protectedBypassDialer{protector: protector},
 		BypassUpstreams: normalizeBypassUpstreams(upstreamDNS),
 		BypassIranLAN:   bypassIranLAN,
+		SuppressAAAA:    true,
 	}
 	if err := dnsSrv.Start(dnsRunCtx, dnsCfg); err != nil {
 		dnsRunCancel()
@@ -274,14 +275,15 @@ func (e *Engine) AttachTun(tunFD int32) error {
 
 	tunRunner := tun.NewFDRunner(int(tunFD))
 	tunCfg := tun.Config{
-		IfaceName:    defaultMobileIfaceName,
-		MTU:          splitroute.TUNMTU,
-		IPv4CIDR:     splitroute.TUNIPv4CIDR,
-		IPv6CIDR:     splitroute.TUNIPv6CIDR,
-		EnableIPv6:   enableIPv6,
-		TunnelDialer: e.ssh,
-		DNSUDPAddr:   dnsSrv.UDPAddr(),
-		DNSTCPAddr:   dnsSrv.TCPAddr(),
+		IfaceName:     defaultMobileIfaceName,
+		MTU:           splitroute.TUNMTU,
+		IPv4CIDR:      splitroute.TUNIPv4CIDR,
+		IPv6CIDR:      splitroute.TUNIPv6CIDR,
+		EnableIPv6:    enableIPv6,
+		BlockIPv6Data: enableIPv6,
+		TunnelDialer:  e.ssh,
+		DNSUDPAddr:    dnsSrv.UDPAddr(),
+		DNSTCPAddr:    dnsSrv.TCPAddr(),
 	}
 	fdHandedToRunner = true
 	if _, err := tunRunner.Start(lifecycleCtx, tunCfg); err != nil {
@@ -395,14 +397,15 @@ func (e *Engine) ReplaceTun(tunFD int32) error {
 
 	newRunner := tun.NewFDRunner(int(tunFD))
 	tunCfg := tun.Config{
-		IfaceName:    defaultMobileIfaceName,
-		MTU:          splitroute.TUNMTU,
-		IPv4CIDR:     splitroute.TUNIPv4CIDR,
-		IPv6CIDR:     splitroute.TUNIPv6CIDR,
-		EnableIPv6:   enableIPv6,
-		TunnelDialer: e.ssh,
-		DNSUDPAddr:   dnsUDP,
-		DNSTCPAddr:   dnsTCP,
+		IfaceName:     defaultMobileIfaceName,
+		MTU:           splitroute.TUNMTU,
+		IPv4CIDR:      splitroute.TUNIPv4CIDR,
+		IPv6CIDR:      splitroute.TUNIPv6CIDR,
+		EnableIPv6:    enableIPv6,
+		BlockIPv6Data: enableIPv6,
+		TunnelDialer:  e.ssh,
+		DNSUDPAddr:    dnsUDP,
+		DNSTCPAddr:    dnsTCP,
 	}
 	fdHandedToRunner = true
 	if _, err := newRunner.Start(lifecycleCtx, tunCfg); err != nil {

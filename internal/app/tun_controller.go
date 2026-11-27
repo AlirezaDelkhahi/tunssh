@@ -194,6 +194,7 @@ func (c *DirectTUNController) StartTUN(ctx context.Context, req TUNStartRequest,
 		},
 		BypassUpstreams: bypassUpstreams,
 		BypassIranLAN:   req.BypassIranLAN,
+		SuppressAAAA:    req.EnableIPv6,
 	}
 	if err := dnsSrv.Start(dnsRunCtx, dnsCfg); err != nil {
 		_ = stopDNSStartWatch()
@@ -215,14 +216,15 @@ func (c *DirectTUNController) StartTUN(ctx context.Context, req TUNStartRequest,
 	}
 
 	tunCfg := tun.Config{
-		IfaceName:    plan.TUNIfaceName,
-		MTU:          splitroute.TUNMTU,
-		IPv4CIDR:     splitroute.TUNIPv4CIDR,
-		IPv6CIDR:     splitroute.TUNIPv6CIDR,
-		EnableIPv6:   req.EnableIPv6,
-		TunnelDialer: dialer,
-		DNSUDPAddr:   dnsSrv.UDPAddr(),
-		DNSTCPAddr:   dnsSrv.TCPAddr(),
+		IfaceName:     plan.TUNIfaceName,
+		MTU:           splitroute.TUNMTU,
+		IPv4CIDR:      splitroute.TUNIPv4CIDR,
+		IPv6CIDR:      splitroute.TUNIPv6CIDR,
+		EnableIPv6:    req.EnableIPv6,
+		BlockIPv6Data: req.EnableIPv6,
+		TunnelDialer:  dialer,
+		DNSUDPAddr:    dnsSrv.UDPAddr(),
+		DNSTCPAddr:    dnsSrv.TCPAddr(),
 	}
 	tunIfIndex, err := tunRunner.Start(ctx, tunCfg)
 	if err != nil {

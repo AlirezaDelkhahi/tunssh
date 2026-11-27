@@ -225,3 +225,44 @@ func TestNewFDRunner_StopWithoutStartClosesFD(t *testing.T) {
 		t.Fatalf("second Stop on unstarted FDRunner failed: %v", err)
 	}
 }
+
+func TestNewFDRunner_StartStopWithBlockIPv6Data(t *testing.T) {
+	fds, err := unix.Socketpair(unix.AF_UNIX, unix.SOCK_SEQPACKET, 0)
+	if err != nil {
+		t.Fatalf("Socketpair failed: %v", err)
+	}
+	defer func() {
+		_ = unix.Close(fds[1])
+		if _, err := unix.FcntlInt(uintptr(fds[0]), unix.F_GETFD, 0); !errors.Is(err, unix.EBADF) {
+			_ = unix.Close(fds[0])
+		}
+	}()
+
+	runner := NewFDRunner(fds[0])
+	cfg := Config{
+		IfaceName:     "tun0",
+		MTU:           DefaultMTU,
+		IPv4CIDR:      DefaultIPv4CIDR,
+		IPv6CIDR:      DefaultIPv6CIDR,
+		EnableIPv6:    true,
+		BlockIPv6Data: true,
+		TunnelDialer:  &mockDialer{},
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	if _, err := runner.Start(ctx, cfg); err != nil {
+		t.Fatalf("NewFDRunner.Start(BlockIPv6Data=true) failed: %v", err)
+	}
+	if !runner.Stats().Running {
+		t.Fatal("expected Running=true after Start")
+	}
+
+	stopCtx, stopCancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer stopCancel()
+	if err := runner.Stop(stopCtx); err != nil {
+		t.Fatalf("Runner.Stop failed: %v", err)
+	}
+	assertFDClosed(t, fds[0])
+}

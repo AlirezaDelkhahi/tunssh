@@ -14,7 +14,9 @@ import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.statusBarsPadding
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.rounded.Close
@@ -52,7 +54,7 @@ fun QrScannerDialog(
     val context = LocalContext.current
     val lifecycleOwner = LocalLifecycleOwner.current
 
-    val analyzerExecutor = remember { Executors.newSingleThreadExecutor() }
+    val analyzerExecutor = remember(lifecycleOwner) { Executors.newSingleThreadExecutor() }
     val handled = remember { AtomicBoolean(false) }
     val previewView = remember { PreviewView(context) }
     var cameraError by remember { mutableStateOf<String?>(null) }
@@ -136,6 +138,8 @@ fun QrScannerDialog(
             border = BorderStroke(1.dp, TunSshColors.BorderSubtle),
             modifier = Modifier
                 .fillMaxWidth()
+                .statusBarsPadding()
+                .navigationBarsPadding()
                 .padding(horizontal = 16.dp),
         ) {
             Column(
